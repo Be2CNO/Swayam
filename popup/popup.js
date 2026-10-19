@@ -1,11 +1,19 @@
 /* ==========================================================================
    Swayam - Bulk AI Prompt Runner
-   popup.js  |  Phase 1: UI shell logic
+   popup/popup.js  |  Phase 2: engine-connected UI logic
    --------------------------------------------------------------------------
-   Handles: file parsing (CSV/TXT) with 500-prompt cap, queue preview rendering,
-   config persistence via chrome.storage.local, and basic control-state wiring.
-   The actual run engine (background queue + content-script automation) lands
-   in later phases; Start/Pause/Stop here only manage local UI state.
+   Handles:
+     - File parsing (CSV/TXT) with the 500-prompt cap (quote-aware parser).
+     - Config persistence via chrome.storage.local ("swayam_config") — the
+       background engine reads the SAME key when a run starts.
+     - Control buttons (Start / Pause / Stop / Resume / Discard) forwarding to
+       background.js via chrome.runtime.sendMessage.
+     - Live UI updates from "STATE_UPDATE" broadcasts + a GET_STATE snapshot
+       on popup open (crash-recovery resume rendering).
+     - Export buttons -> EXPORT_RESULTS -> chrome.downloads in the worker.
+
+   The queue is now owned by the background engine; this file only uploads it
+   at Start and renders whatever state the engine reports.
    ========================================================================== */
 
 "use strict";
@@ -13,7 +21,6 @@
 const MAX_PROMPTS = 500;
 const STORAGE_KEYS = {
   config: "swayam_config",
-  queue: "swayam_queue",
 };
 
 /* --------------------------- DOM references --------------------------- */
@@ -59,7 +66,22 @@ const els = {
 const exportButtons = Array.from(document.querySelectorAll(".export-btn"));
 
 /* ----------------------------- App state ------------------------------ */
-let prompts = []; // array of { text, status: pending|running|done|failed }
+let prompts = [];        // local parsed preview: array of prompt strings
+let lastState = null;    // most recent engine state snapshot (source of truth for UI)
+let busy = false;        // guard against double-clicking controls while awaiting a reply
+
+/* ------------------------- Messaging helpers -------------------------- */
+
+/** Send a command to the background worker and await its JSON reply. */
+async function sendToBackground(message) {
+  try {
+    const reply = await chrome.runtime.sendMessage(message);
+    return reply || { ok: false, error: "No response from background worker." };
+  } catch (err) {
+    console.error(`[Swayam Popup] sendMessage(${message.type}) failed:`, err);
+    return { ok: false, error: String(err && err.message ? err.message : err) };
+  }
+}
 
 /* --------------------------- File parsing ----------------------------- */
 
@@ -143,7 +165,7 @@ function handleFile(file) {
       const truncated = parsed.length > MAX_PROMPTS;
       const kept = parsed.slice(0, MAX_PROMPTS);
 
-      prompts = kept.map((text) => ({ text, status: "pending" }));
+      prompts = kept;
 
       els.fileName.textContent = file.name;
       els.promptCount.textContent = `${prompts.length} prompts`;
@@ -151,10 +173,7 @@ function handleFile(file) {
       els.fileInfo.classList.remove("hidden");
       els.dropZone.classList.add("hidden");
 
-      updateControls();
-      renderQueue();
-      updateStats();
-      saveQueueToStorage();
+      renderFromState(lastState);
       console.log(`[Swayam Popup] Loaded ${prompts.length} prompts from "${file.name}"${truncated ? " (truncated to 500)" : ""}`);
     } catch (err) {
       console.error("[Swayam Popup] Parse error:", err);
@@ -170,19 +189,36 @@ function clearFile() {
   els.fileInput.value = "";
   els.fileInfo.classList.add("hidden");
   els.dropZone.classList.remove("hidden");
-  updateControls();
-  renderQueue();
-  updateStats();
-  saveQueueToStorage();
+  renderFromState(lastState);
 }
 
 /* --------------------------- Queue rendering -------------------------- */
+
+/** Status shown per queue row: engine items win over the local preview. */
+function rowStatus(i) {
+  const eng = lastState && Array.isArray(lastState.items) ? lastState.items[i] : null;
+  if (eng && eng.status) return eng.status;
+  if (prompts[i] != null) return "pending";
+  return "pending";
+}
+
+function rowText(i) {
+  const eng = lastState && Array.isArray(lastState.items) ? lastState.items[i] : null;
+  if (eng && typeof eng.text === "string") return eng.text;
+  return prompts[i] != null ? prompts[i] : "";
+}
+
+function visibleRowCount() {
+  const engCount = lastState && Array.isArray(lastState.items) ? lastState.items.length : 0;
+  return Math.max(engCount, prompts.length);
+}
 
 function renderQueue() {
   const filter = (els.queueSearch.value || "").toLowerCase();
   els.queueList.innerHTML = "";
 
-  if (prompts.length === 0) {
+  const count = visibleRowCount();
+  if (count === 0) {
     const li = document.createElement("li");
     li.className = "queue-empty";
     li.textContent = "No prompts loaded yet. Upload a file above.";
@@ -191,10 +227,13 @@ function renderQueue() {
   }
 
   const frag = document.createDocumentFragment();
-  prompts.forEach((p, i) => {
-    if (filter && !p.text.toLowerCase().includes(filter)) return;
+  for (let i = 0; i < count; i++) {
+    const text = rowText(i);
+    if (filter && !text.toLowerCase().includes(filter)) continue;
+
     const li = document.createElement("li");
     li.className = "queue-item";
+    if (lastState && lastState.currentIndex === i) li.classList.add("queue-current");
     li.dataset.index = String(i);
 
     const idx = document.createElement("span");
@@ -203,25 +242,66 @@ function renderQueue() {
 
     const txt = document.createElement("span");
     txt.className = "queue-text";
-    txt.textContent = p.text;
-    txt.title = p.text;
+    txt.textContent = text;
+    txt.title = text;
 
     const state = document.createElement("span");
-    state.className = `queue-state ${p.status}`;
-    state.textContent = p.status;
+    const st = rowStatus(i);
+    state.className = `queue-state ${st}`;
+    state.textContent = st;
 
     li.append(idx, txt, state);
     frag.appendChild(li);
-  });
+  }
   els.queueList.appendChild(frag);
+
+  // Keep the in-flight row in view while running.
+  if (lastState && lastState.currentIndex >= 0) {
+    const cur = els.queueList.querySelector(".queue-current");
+    if (cur) cur.scrollIntoView({ block: "nearest" });
+  }
 }
 
 /* ---------------------------- Stats / UI ------------------------------ */
 
-function updateStats() {
-  const total = prompts.length;
-  const done = prompts.filter((p) => p.status === "done").length;
-  const failed = prompts.filter((p) => p.status === "failed").length;
+/** Map engine status -> dot CSS class + human label. */
+const STATUS_UI = {
+  IDLE:            { dot: "idle",    label: "Idle" },
+  RUNNING:         { dot: "running", label: "Running" },
+  RETRYING_FAILED: { dot: "running", label: "Retrying failed" },
+  PAUSED:          { dot: "paused",  label: "Paused" },
+  WAITING_LOGIN:   { dot: "paused",  label: "Waiting for login" },
+  STOPPED:         { dot: "stopped", label: "Stopped" },
+  COMPLETED:       { dot: "done",    label: "Completed" },
+};
+
+function setStatus(status) {
+  const ui = STATUS_UI[status] || STATUS_UI.IDLE;
+  els.statusDot.className = `status-dot ${ui.dot}`;
+  els.statusText.textContent = ui.label;
+}
+
+function flashStatus(message, dotClass) {
+  els.statusDot.className = `status-dot ${dotClass}`;
+  els.statusText.textContent = message;
+}
+
+/**
+ * Master render: derive everything (stats, progress, controls, banners,
+ * queue) from the latest engine state. `state` may be null (never ran).
+ */
+function renderFromState(state) {
+  lastState = state || null;
+  const s = lastState;
+  const status = s ? s.status : "IDLE";
+  const items = s && Array.isArray(s.items) ? s.items : [];
+
+  setStatus(status);
+
+  // ----- stats & progress -----
+  const total = items.length;
+  const done = items.filter((i) => i.status === "done").length;
+  const failed = items.filter((i) => i.status === "failed").length;
   const pending = total - done - failed;
   const pct = total === 0 ? 0 : Math.round(((done + failed) / total) * 100);
 
@@ -233,25 +313,39 @@ function updateStats() {
   els.progressTrack.setAttribute("aria-valuenow", String(pct));
 
   const hasResults = done + failed > 0;
-  exportButtons.forEach((b) => (b.disabled = !hasResults));
-}
+  exportButtons.forEach((b) => (b.disabled = !hasResults || busy));
 
-function setStatus(status) {
-  els.statusDot.className = `status-dot ${status}`;
-  els.statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
-}
+  // ----- control enablement -----
+  const isActive = status === "RUNNING" || status === "RETRYING_FAILED";
+  const resumable = status === "PAUSED" || status === "WAITING_LOGIN" ||
+    !!(s && s.recoveredFromCrash && status !== "IDLE" && status !== "COMPLETED" && status !== "STOPPED");
 
-function flashStatus(message, dotClass) {
-  els.statusDot.className = `status-dot ${dotClass}`;
-  els.statusText.textContent = message;
-}
+  const canStartFresh = prompts.length > 0 || (isActive || resumable ? false : total > 0);
+  els.btnStart.disabled = busy || !canStartFresh;
+  els.btnPause.disabled = busy || !isActive;
+  els.btnStop.disabled = busy || !(isActive || status === "PAUSED" || status === "WAITING_LOGIN");
+  els.btnResume.classList.toggle("hidden", !resumable);
+  els.btnResume.disabled = busy;
 
-function updateControls() {
-  const hasPrompts = prompts.length > 0;
-  els.btnStart.disabled = !hasPrompts;
-  els.btnPause.disabled = true;  // enabled by the run engine in a later phase
-  els.btnStop.disabled = true;
-  els.btnResume.classList.add("hidden");
+  // ----- banners -----
+  els.loginBanner.classList.toggle("hidden", status !== "WAITING_LOGIN");
+
+  const interrupted = !!(s && s.recoveredFromCrash && (status === "PAUSED" || status === "WAITING_LOGIN"));
+  els.recoveryBanner.classList.toggle("hidden", !interrupted);
+  if (interrupted) {
+    const nextIdx = items.findIndex((i) => i.status === "pending");
+    els.recoveryIndex.textContent = `#${nextIdx >= 0 ? nextIdx + 1 : total + 1}`;
+  }
+
+  // ----- engine info / errors as a transient status line -----
+  if (s && s.lastError && !isActive) {
+    els.statusText.textContent = s.lastError.length > 60 ? s.lastError.slice(0, 57) + "…" : s.lastError;
+    els.statusText.title = s.lastError;
+  } else {
+    els.statusText.removeAttribute("title");
+  }
+
+  renderQueue();
 }
 
 /* ------------------------- Storage persistence ------------------------ */
@@ -290,18 +384,62 @@ async function loadConfig() {
   }
 }
 
-async function saveQueueToStorage() {
-  try {
-    await chrome.storage.local.set({ [STORAGE_KEYS.queue]: prompts });
-  } catch (err) {
-    console.error("[Swayam Popup] Failed saving queue snapshot:", err);
-  }
-}
-
 function clampInt(value, min, max, fallback) {
   const n = parseInt(String(value), 10);
   if (Number.isNaN(n)) return fallback;
   return Math.min(max, Math.max(min, n));
+}
+
+/* --------------------------- Run controls ----------------------------- */
+
+/** Persist config first (the worker reads swayam_config at START_RUN). */
+async function onStart() {
+  if (prompts.length === 0) {
+    flashStatus("Upload a file first", "stopped");
+    return;
+  }
+  busy = true;
+  renderFromState(lastState);
+  await saveConfig();
+  const reply = await sendToBackground({ type: "START_RUN", queue: prompts });
+  busy = false;
+  if (!reply.ok) {
+    flashStatus(reply.error || "Failed to start", "stopped");
+  }
+  const fresh = await sendToBackground({ type: "GET_STATE" });
+  renderFromState(fresh.ok ? fresh.state : lastState);
+}
+
+async function onControl(action) {
+  busy = true;
+  renderFromState(lastState);
+  const reply = await sendToBackground({ type: action });
+  if (!reply.ok) console.warn(`[Swayam Popup] ${action}:`, reply.error);
+  const fresh = await sendToBackground({ type: "GET_STATE" });
+  busy = false;
+  renderFromState(fresh.ok ? fresh.state : lastState);
+}
+
+async function onDiscardRecovery() {
+  busy = true;
+  const reply = await sendToBackground({ type: "DISCARD_RECOVERY" });
+  if (!reply.ok) console.warn("[Swayam Popup] DISCARD_RECOVERY:", reply.error);
+  const fresh = await sendToBackground({ type: "GET_STATE" });
+  busy = false;
+  renderFromState(fresh.ok ? fresh.state : null);
+}
+
+async function onExport(format) {
+  busy = true;
+  renderFromState(lastState);
+  const reply = await sendToBackground({ type: "EXPORT_RESULTS", format });
+  busy = false;
+  if (reply.ok) {
+    flashStatus(`Saved ${reply.filename}`, "done");
+  } else {
+    flashStatus(reply.error || "Export failed", "stopped");
+  }
+  renderFromState(lastState);
 }
 
 /* ------------------------------ Events ------------------------------- */
@@ -333,54 +471,44 @@ function bindEvents() {
 
   els.btnRemoveFile.addEventListener("click", clearFile);
 
-  // Config persistence
+  // Config persistence (the engine picks these up on the next START_RUN)
   [els.aiSelect, els.newChatEvery, els.delayBetween, els.responseTimeout]
     .forEach((el) => el.addEventListener("change", saveConfig));
   document.querySelectorAll('input[name="chatStrategy"]')
     .forEach((r) => r.addEventListener("change", saveConfig));
 
-  // Run controls — wired to the engine in a later phase.
-  els.btnStart.addEventListener("click", () => {
-    console.log("[Swayam Popup] START clicked. Engine will be connected in Phase 2+.", collectConfigForEngine());
-  });
-  els.btnPause.addEventListener("click", () => console.log("[Swayam Popup] PAUSE clicked."));
-  els.btnStop.addEventListener("click", () => console.log("[Swayam Popup] STOP clicked."));
-  els.btnResume.addEventListener("click", () => console.log("[Swayam Popup] RESUME clicked."));
-  els.btnDiscardRecovery.addEventListener("click", () => {
-    els.recoveryBanner.classList.add("hidden");
-    console.log("[Swayam Popup] Recovery snapshot discarded.");
-  });
+  // Run controls -> background engine
+  els.btnStart.addEventListener("click", onStart);
+  els.btnPause.addEventListener("click", () => onControl("PAUSE_RUN"));
+  els.btnStop.addEventListener("click", () => onControl("STOP_RUN"));
+  els.btnResume.addEventListener("click", () => onControl("RESUME_RUN"));
+  els.btnDiscardRecovery.addEventListener("click", onDiscardRecovery);
 
   // Queue filter
   els.queueSearch.addEventListener("input", renderQueue);
 
-  // Export buttons — real chrome.downloads export arrives in a later phase.
+  // Export -> chrome.downloads via the background worker
   exportButtons.forEach((btn) =>
-    btn.addEventListener("click", () =>
-      console.log(`[Swayam Popup] Export as ${btn.dataset.export.toUpperCase()} requested. Will use chrome.downloads in a later phase.`)
-    )
+    btn.addEventListener("click", () => onExport(btn.dataset.export))
   );
-}
 
-function collectConfigForEngine() {
-  const strategy = document.querySelector('input[name="chatStrategy"]:checked');
-  return {
-    ai: els.aiSelect.value,
-    chatStrategy: strategy ? strategy.value : "single",
-    newChatEvery: clampInt(els.newChatEvery.value, 1, MAX_PROMPTS, 25),
-    delayBetween: clampInt(els.delayBetween.value, 1000, 600000, 3000),
-    responseTimeout: clampInt(els.responseTimeout.value, 10, 3600, 120),
-    promptCount: prompts.length,
-  };
+  // Live updates from the engine
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message && message.type === "STATE_UPDATE" && message.state) {
+      renderFromState(message.state);
+    }
+  });
 }
 
 /* ------------------------------- Init -------------------------------- */
 
 document.addEventListener("DOMContentLoaded", async () => {
-  console.log("[Swayam Popup] Phase 1 UI shell initialized.");
-  setStatus("idle");
+  console.log("[Swayam Popup] Phase 2 UI initialized — engine connected.");
   await loadConfig();
   bindEvents();
-  renderQueue();
-  updateStats();
+
+  // Fetch current engine state so a reopened popup resumes rendering
+  // (progress, queue statuses, recovery banner) exactly where the run is.
+  const reply = await sendToBackground({ type: "GET_STATE" });
+  renderFromState(reply.ok ? reply.state : null);
 });

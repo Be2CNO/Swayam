@@ -362,6 +362,12 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Highlight the prompt currently in flight (engine state) */
+.queue-item.queue-current {
+  border-color: var(--accent);
+  background: rgba(99, 102, 241, 0.12);
+}
+
 .queue-state { font-size: 10px; font-weight: 700; text-transform: uppercase; }
 .queue-state.pending { color: var(--text-dim); }
 .queue-state.running { color: var(--accent); }
