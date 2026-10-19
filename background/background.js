@@ -386,7 +386,13 @@ async function sendPromptToIndex(idx) {
     if (!(await contentScriptAlive(S.activeTabId))) {
       try {
         await chrome.scripting.executeScript({
-          files: ["content-scripts/content-script.js"],
+          files: [
+            "content-scripts/adapters/adapter-utils.js",
+            "content-scripts/adapters/chatgpt-adapter.js",
+            "content-scripts/adapters/gemini-adapter.js",
+            "content-scripts/adapters/claude-adapter.js",
+            "content-scripts/content-script.js",
+          ],
           target: { tabId: S.activeTabId },
         });
       } catch (err) {
@@ -413,6 +419,8 @@ async function sendPromptToIndex(idx) {
       type: "SEND_PROMPT",
       index: idx,
       text: item.text,
+      // Content script honors this as its hard capture timeout (spec 4).
+      timeoutSeconds: Math.max(10, Number(S.settings.responseTimeout) || 120),
     });
 
     await scheduleStepAlarm(Date.now() + timeoutMs);
