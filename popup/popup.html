@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Swayam - Bulk AI Prompt Runner</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <!-- ============ HEADER ============ -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-logo" aria-hidden="true">S</div>
+      <div class="brand-text">
+        <h1>Swayam</h1>
+        <p>Bulk AI Prompt Runner</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <span id="engineStatusDot" class="status-dot idle"></span>
+      <span id="engineStatusText" class="status-text">Idle</span>
+    </div>
+  </header>
+
+  <main class="app-main">
+
+    <!-- ============ STEP 1: FILE UPLOAD ============ -->
+    <section class="card" id="sectionUpload">
+      <h2 class="card-title"><span class="step-badge">1</span> Upload Prompts</h2>
+      <div id="dropZone" class="drop-zone" tabindex="0" role="button"
+           aria-label="Upload a CSV or TXT file of prompts">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <p class="drop-title">Drop a <strong>.csv</strong> or <strong>.txt</strong> file here</p>
+        <p class="drop-sub">or click to browse &middot; max 500 prompts per run</p>
+        <input type="file" id="fileInput" accept=".csv,.txt,text/csv,text/plain" hidden />
+      </div>
+      <div id="fileInfo" class="file-info hidden">
+        <div class="file-meta">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <span id="fileName">file.csv</span>
+          <span id="promptCount" class="chip">0 prompts</span>
+          <span id="limitWarning" class="chip chip-warn hidden">Over 500 limit - will be truncated</span>
+        </div>
+        <button id="btnRemoveFile" class="btn btn-ghost btn-sm" title="Remove file">Remove</button>
+      </div>
+    </section>
+
+    <!-- ============ STEP 2: CONFIGURATION ============ -->
+    <section class="card" id="sectionConfig">
+      <h2 class="card-title"><span class="step-badge">2</span> Configure Run</h2>
+
+      <div class="field">
+        <label for="aiSelect">Target AI Website</label>
+        <select id="aiSelect" class="input">
+          <option value="chatgpt">ChatGPT (chat.openai.com)</option>
+          <option value="gemini">Gemini (gemini.google.com)</option>
+          <option value="claude">Claude (claude.ai)</option>
+        </select>
+        <small class="hint">The extension uses the model you have selected in the site's own UI. It never logs you in or changes models.</small>
+      </div>
+
+      <div class="field">
+        <label>Chat Strategy</label>
+        <div class="radio-group" role="radiogroup" aria-label="Chat strategy">
+          <label class="radio">
+            <input type="radio" name="chatStrategy" value="single" checked />
+            <span>One chat for all prompts</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="chatStrategy" value="new-chat" />
+            <span>New chat every</span>
+            <input type="number" id="newChatEvery" class="input input-number" min="1" max="500" value="25" />
+            <span>prompts</span>
+          </label>
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced settings</summary>
+        <div class="field-row">
+          <div class="field">
+            <label for="delayBetween">Delay between prompts (ms)</label>
+            <input type="number" id="delayBetween" class="input" min="1000" step="500" value="3000" />
+          </div>
+          <div class="field">
+            <label for="responseTimeout">Response timeout (s)</label>
+            <input type="number" id="responseTimeout" class="input" min="10" step="5" value="120" />
+          </div>
+        </div>
+        <small class="hint">Failed / timed-out prompts are skipped during the run and retried automatically at the very end.</small>
+      </details>
+    </section>
+
+    <!-- ============ STEP 3: CONTROLS ============ -->
+    <section class="card" id="sectionControls">
+      <h2 class="card-title"><span class="step-badge">3</span> Run Control</h2>
+      <div class="controls">
+        <button id="btnStart" class="btn btn-primary" disabled>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
+          Start
+        </button>
+        <button id="btnPause" class="btn btn-warn" disabled>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="4" width="5" height="16"/><rect x="14" y="4" width="5" height="16"/></svg>
+          Pause
+        </button>
+        <button id="btnStop" class="btn btn-danger" disabled>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+          Stop
+        </button>
+        <button id="btnResume" class="btn btn-secondary hidden">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
+          Resume
+        </button>
+      </div>
+      <div id="loginBanner" class="banner banner-warn hidden">
+        &#9888; Not logged in on the target AI site. Log in manually in the tab, then press <strong>Resume</strong>.
+      </div>
+      <div id="recoveryBanner" class="banner banner-info hidden">
+        &#8617; An interrupted session was found. You can <strong>Resume</strong> from prompt
+        <span id="recoveryIndex">#0</span>, or Start to overwrite.
+        <button id="btnDiscardRecovery" class="btn btn-ghost btn-sm">Discard</button>
+      </div>
+    </section>
+
+    <!-- ============ PROGRESS DASHBOARD ============ -->
+    <section class="card" id="sectionProgress">
+      <h2 class="card-title">Progress Dashboard</h2>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack">
+        <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+      </div>
+      <div class="stats-grid">
+        <div class="stat"><span class="stat-num" id="statTotal">0</span><span class="stat-label">Total</span></div>
+        <div class="stat"><span class="stat-num stat-ok" id="statDone">0</span><span class="stat-label">Done</span></div>
+        <div class="stat"><span class="stat-num stat-fail" id="statFailed">0</span><span class="stat-label">Failed</span></div>
+        <div class="stat"><span class="stat-num" id="statPending">0</span><span class="stat-label">Pending</span></div>
+      </div>
+      <div class="export-row">
+        <span class="export-label">Export results:</span>
+        <button class="btn btn-secondary btn-sm export-btn" data-export="csv" disabled>CSV</button>
+        <button class="btn btn-secondary btn-sm export-btn" data-export="json" disabled>JSON</button>
+        <button class="btn btn-secondary btn-sm export-btn" data-export="txt" disabled>TXT</button>
+      </div>
+    </section>
+
+    <!-- ============ QUEUE PREVIEW ============ -->
+    <section class="card" id="sectionQueue">
+      <div class="queue-head">
+        <h2 class="card-title">Queue Preview</h2>
+        <input type="search" id="queueSearch" class="input input-search" placeholder="Filter prompts&#8230;" />
+      </div>
+      <ul id="queueList" class="queue-list">
+        <li class="queue-empty">No prompts loaded yet. Upload a file above.</li>
+      </ul>
+    </section>
+
+  </main>
+
+  <footer class="app-footer">
+    <p>100% local &middot; No APIs &middot; No telemetry &middot; State saved via <code>chrome.storage.local</code> for crash recovery</p>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
