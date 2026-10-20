@@ -58,7 +58,8 @@
     "https://www.gemini.google.com/*",
     "https://gemini.google.com/*",
     "https://www.claude.ai/*",
-    "https://claude.ai/*"
+    "https://claude.ai/*",
+    "https://cdn.openai.com/*"
   ],
 
   "icons": {

@@ -500,12 +500,30 @@ function bindEvents() {
   });
 }
 
-/* ------------------------------- Init -------------------------------- */
+/* ------------------------------ Init -------------------------------- */
+
+/**
+ * Fallback live-refresh: the popup CANNOT receive chrome.tabs.sendMessage
+ * broadcasts (different extension context), so if no STATE_UPDATE arrives
+ * within a couple of seconds while a run is active, poll GET_STATE directly.
+ */
+let statePollTimer = null;
+function startStatePolling() {
+  if (statePollTimer) return;
+  statePollTimer = setInterval(async () => {
+    const s = lastState && lastState.status;
+    const active = s === "RUNNING" || s === "RETRYING_FAILED" || s === "WAITING_LOGIN";
+    if (!active) return; // broadcasts handle idle states fine
+    const reply = await sendToBackground({ type: "GET_STATE" });
+    if (reply.ok && reply.state) renderFromState(reply.state);
+  }, 2000);
+}
 
 document.addEventListener("DOMContentLoaded", async () => {
   console.log("[Swayam Popup] Phase 2 UI initialized — engine connected.");
   await loadConfig();
   bindEvents();
+  startStatePolling();
 
   // Fetch current engine state so a reopened popup resumes rendering
   // (progress, queue statuses, recovery banner) exactly where the run is.

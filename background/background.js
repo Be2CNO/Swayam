@@ -345,6 +345,14 @@ async function runNext() {
     return createNewChatThen();
   }
 
+  // Inter-prompt delay applies to every dispatch EXCEPT the very first one of
+  // a run/fresh resume, so the user is not kept waiting before anything has
+  // even been sent.
+  const firstDispatchOfRun = !S.items.some((i) => i.attempted || i.status === "done" || i.status === "failed");
+  if (!firstDispatchOfRun) {
+    return delayedDispatch();
+  }
+
   return sendPromptToIndex(idx);
 }
 
@@ -627,6 +635,20 @@ async function resumeRun() {
   if (S.status === STATUS.COMPLETED || S.status === STATUS.STOPPED) {
     return { ok: false, error: `Run is ${S.status}. Press Start for a new run.` };
   }
+
+  // If an in-flight step was interrupted by the crash/pause, settle it before
+  // advancing so we never leave two prompts "running" simultaneously.
+  const inflightIdx = S.currentIndex;
+  if ((S.phase === PHASE.SENDING || S.phase === PHASE.AWAIT_NEW_CHAT) &&
+      inflightIdx >= 0 && S.items[inflightIdx] && S.items[inflightIdx].status === "running") {
+    failItem(inflightIdx, "Interrupted mid-request — will be retried at the end.");
+  }
+  for (const it of S.items) if (it.status === "running") it.status = "pending";
+  S.currentIndex = -1;
+  S.phase = PHASE.IDLE;
+  S.deadline = 0;
+  chrome.alarms.clear(ALARM_STEP);
+
   // PAUSED or WAITING_LOGIN -> decide which pass we belong to:
   // if any never-attempted prompt remains we re-enter the MAIN pass,
   // otherwise any remaining pendings are retry items -> RETRYING_FAILED pass.
@@ -638,8 +660,8 @@ async function resumeRun() {
       .filter((i) => i >= 0);
     if (S.retryQueue.length === 0) return finishRun().then(() => ({ ok: true }));
   }
-  S.phase = PHASE.IDLE;
   S.lastError = "";
+  S.recoveredFromCrash = false;
   chrome.alarms.clear(ALARM_AUTOLOGIN);
   await persistState();
   broadcastState();
@@ -741,22 +763,49 @@ function exportResults(format) {
   if (!hasAny) return { ok: false, error: "Nothing has run yet — no results to export." };
 
   const { filename, mime, data } = buildExport(format === "json" || format === "txt" ? format : "csv");
-  const url = "data:" + mime + ";charset=utf-8," + encodeURIComponent(data);
+
+  // Blob URL instead of a data: URL — Chrome caps data: URLs at ~2 MB, which
+  // large multi-prompt exports exceed. (Blob/data URLs are valid for
+  // chrome.downloads.download.) Fall back to data: if Blob is unavailable.
+  let url;
+  try {
+    url = URL.createObjectURL(new Blob([data], { type: mime }));
+  } catch (err) {
+    console.warn("[Swayam BG] Blob URL failed, falling back to data: URL:", err);
+    url = "data:" + mime + ";charset=utf-8," + encodeURIComponent(data);
+  }
 
   return new Promise((resolve) => {
     chrome.downloads.download(
       { url, filename, saveAs: false }, // relative filename => lands in default Downloads folder
       (downloadId) => {
-        if (chrome.runtime.lastError) {
-          console.error("[Swayam BG] Download failed:", chrome.runtime.lastError);
-          resolve({ ok: false, error: chrome.runtime.lastError.message });
+        if (chrome.runtime.lastError || typeof downloadId !== "number") {
+          const msg = chrome.runtime.lastError ? chrome.runtime.lastError.message : "Download rejected.";
+          console.error("[Swayam BG] Download failed:", msg);
+          revokeQuietly(url);
+          resolve({ ok: false, error: msg });
         } else {
           console.log(`[Swayam BG] Exported "${filename}" (download #${downloadId}).`);
+          // Revoke once the download finishes (or after a generous grace
+          // period) so the blob memory is not leaked by long sessions.
+          const onDone = (delta) => {
+            if (delta.id === downloadId && delta.state &&
+                (delta.state.current === "complete" || delta.state.current === "interrupted")) {
+              chrome.downloads.onChanged.removeListener(onDone);
+              revokeQuietly(url);
+            }
+          };
+          try { chrome.downloads.onChanged.addListener(onDone); } catch (_) {}
+          setTimeout(() => { chrome.downloads.onChanged.removeListener(onDone); revokeQuietly(url); }, 120000);
           resolve({ ok: true, filename, downloadId });
         }
       }
     );
   });
+}
+
+function revokeQuietly(blobUrl) {
+  try { if (blobUrl && blobUrl.startsWith("blob:")) URL.revokeObjectURL(blobUrl); } catch (_) {}
 }
 
 /* ------------------------ Content-script events ------------------------ */
@@ -827,6 +876,7 @@ async function onNewChatReady(ok, error) {
   if (!S || S.phase !== PHASE.AWAIT_NEW_CHAT) return;
   chrome.alarms.clear(ALARM_STEP);
   S.phase = PHASE.IDLE;
+  S.deadline = 0;
   if (ok) {
     S.promptsSinceChat = 0;
   } else {
@@ -840,9 +890,21 @@ async function onNewChatReady(ok, error) {
   await runNext();
 }
 
+/**
+ * Content-script failure for a NEW-CHAT request (index -1). Without this the
+ * engine would sit in AWAIT_NEW_CHAT until the timeout alarm fired.
+ */
+async function onNewChatFailed(error) {
+  if (!S || S.phase !== PHASE.AWAIT_NEW_CHAT) return; // stray / stale message
+  await onNewChatReady(false, String(error || "new_chat_failed"));
+}
+
 async function onNotLoggedIn() {
   if (!S) return;
-  if (S.status !== STATUS.RUNNING && S.status !== STATUS.RETRYING_FAILED) return;
+  // Accept from RUNNING, RETRYING_FAILED, or an already-WAITING_LOGIN tab
+  // (idempotent — re-arms the poll without corrupting state).
+  if (S.status !== STATUS.RUNNING && S.status !== STATUS.RETRYING_FAILED &&
+      S.status !== STATUS.WAITING_LOGIN) return;
   const idx = S.currentIndex;
   if (idx >= 0 && S.items[idx] && S.items[idx].status === "running") {
     S.items[idx].status = "pending"; // nothing actually got sent
@@ -1008,7 +1070,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true });
         break;
       case "RESPONSE_FAILED":
-        if (fromContentScript) await onResponseFailed(Number(message.index), message.error);
+        if (fromContentScript) {
+          const failedIdx = Number(message.index);
+          // index -1 => the CREATE_NEW_CHAT flow failed, not a prompt. Route it
+          // so the engine resumes immediately instead of waiting for timeout.
+          if (failedIdx === -1) await onNewChatFailed(message.error);
+          else await onResponseFailed(failedIdx, message.error);
+        }
         sendResponse({ ok: true });
         break;
       case "NEW_CHAT_READY":

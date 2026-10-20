@@ -81,9 +81,13 @@
       return;
     }
     if (currentJob) {
-      // Defensive: engine should never overlap; refuse politely.
-      postToBackground({ type: "RESPONSE_FAILED", index, error: "busy_previous_prompt_in_flight" });
-      return;
+      // Defensive: engine should never overlap. Instead of refusing outright
+      // (which would permanently fail the new prompt), abort the stale job and
+      // take over — the old prompt gets no capture and will be retried at the
+      // end by the engine's timeout/retry machinery.
+      console.warn(`[Swayam CS] Overlapping SEND_PROMPT (#${index}) — aborting stale job #${currentJob.index}.`);
+      try { currentJob.aborted = true; adapter.abortCurrent && adapter.abortCurrent(); } catch (_) {}
+      currentJob = null;
     }
 
     const job = newJob(index);
@@ -111,6 +115,11 @@
       return;
     }
 
+    // If the user paused/stopped while we were filling the composer, the
+    // engine has already dispatched ABORT_CURRENT — abandon before observing
+    // so a late capture can never leak into the next prompt's slot.
+    if (currentJob === job && job.aborted) { currentJob = null; return; }
+
     // 2) Wait until a NEW assistant message appears (or the last one changes).
     const appeared = await utils.waitFor(() => {
       const nodes = document.querySelectorAll(
@@ -134,16 +143,44 @@
     const hardMs = Math.max(10, Number(timeoutSeconds) || 120) * 1000;
     const result = await adapter.observeResponse({ settleMs: 2500, hardTimeoutMs: hardMs });
 
-    if (!job.aborted) {
+    if (!job.aborted && currentJob === job) {
       if (result && result.ok) {
         postToBackground({ type: "RESPONSE_CAPTURED", index, text: result.text || "" });
       } else {
         const reason = (result && result.error) || "capture_failed";
         postToBackground({ type: "RESPONSE_FAILED", index, error: reason });
       }
+      currentJob = null;
     }
-    currentJob = null;
   }
+
+  /* ------------------------ In-page state sync --------------------------- */
+  // The popup lives in a separate extension context and CANNOT receive
+  // chrome.tabs.sendMessage. This page-side listener lets the popup read the
+  // engine's latest broadcast directly from the DOM as a fallback channel.
+  let lastBroadcastAt = 0;
+  function syncStateToDom(state) {
+    try {
+      document.documentElement.setAttribute("data-swayam-status", String((state && state.status) || "IDLE"));
+      const json = JSON.stringify(state || null);
+      if (json && json.length <= 2000000) {
+        document.documentElement.setAttribute("data-swayam-state", json);
+      }
+    } catch (_) { /* oversized / circular — ignore */ }
+  }
+  const stateSyncTimer = setInterval(() => {
+    if (!lastBroadcastAt) return;
+    try {
+      const raw = document.documentElement.getAttribute("data-swayam-state");
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.updatedAt === "number" && parsed.updatedAt > lastBroadcastAt) {
+        lastBroadcastAt = parsed.updatedAt;
+        syncStateToDom(parsed); // refresh status attribute to match newer state
+      }
+    } catch (_) { /* malformed snapshot — ignore */ }
+  }, 1000);
+  window.addEventListener("unload", () => clearInterval(stateSyncTimer));
 
   /* --------------------------- CREATE_NEW_CHAT --------------------------- */
   async function handleCreateNewChat() {
@@ -156,16 +193,20 @@
       if (res && res.ok) {
         postToBackground({ type: "NEW_CHAT_READY", ok: true });
       } else {
+        // Protocol note: background.js routes NEW_CHAT_READY{ok:false} to its
+        // onNewChatReady handler (continues in current chat). Sending
+        // RESPONSE_FAILED here would be swallowed by the prompt guard, so we
+        // always answer with NEW_CHAT_READY.
         postToBackground({
-          type: "RESPONSE_FAILED",
-          index: -1,
+          type: "NEW_CHAT_READY",
+          ok: false,
           error: `new_chat_failed:${(res && res.error) || "unknown"}`,
         });
       }
     } catch (err) {
       postToBackground({
-        type: "RESPONSE_FAILED",
-        index: -1,
+        type: "NEW_CHAT_READY",
+        ok: false,
         error: `new_chat_failed:${String(err && err.message ? err.message : err)}`,
       });
     }
@@ -198,8 +239,15 @@
   /* --------------------------- Message router ---------------------------- */
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message.type !== "string") return false;
-    // Ignore our own outbound broadcasts echoed back / STATE_UPDATE noise.
-    if (message.type === "STATE_UPDATE") return false;
+    // Engine state broadcast: mirror it into the DOM so the popup can read
+    // live progress even though it cannot receive tabs messages directly.
+    if (message.type === "STATE_UPDATE") {
+      syncStateToDom(message.state);
+      if (message.state && typeof message.state.updatedAt === "number") {
+        lastBroadcastAt = Math.max(lastBroadcastAt, message.state.updatedAt);
+      }
+      return false;
+    }
 
     switch (message.type) {
       case "PING":
