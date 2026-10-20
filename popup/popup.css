@@ -386,6 +386,24 @@ body {
 }
 .app-footer code { color: var(--accent); font-size: 9.5px; }
 
+/* Phase 5.1 — Tip line + developer credit */
+.app-footer .tip-line {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.app-footer .dev-credit {
+  margin-top: 6px;
+  font-size: 10px;
+  color: #8a8f9c;
+  text-align: center;
+}
+.app-footer .dev-credit a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.app-footer .dev-credit a:hover { text-decoration: underline; }
+
 /* ============ UTILITIES ============ */
 .hidden { display: none !important; }
 

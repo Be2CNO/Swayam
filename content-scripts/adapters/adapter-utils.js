@@ -207,6 +207,28 @@
       }
     },
 
+    /**
+     * True if `el` is NOT clickable right now. Covers:
+     *  - the native `disabled` attribute/property,
+     *  - ARIA `aria-disabled="true"` (React apps like ChatGPT keep the button
+     *    "disabled" via aria/class state instead of the native attribute),
+     *  - common disabled-looking utility classes (Tailwind `disabled:*`,
+     *    shadcn `bg-button-disabled`, opacity-0 / invisible / cursor-not-allowed).
+     * Only used as a heuristic — callers still fall back to pressing Enter.
+     */
+    isDisabledLike(el) {
+      if (!el) return true;
+      try {
+        if (el.disabled === true) return true;
+        if (el.getAttribute && el.getAttribute("aria-disabled") === "true") return true;
+        const cls = typeof el.className === "string" ? el.className : "";
+        if (/\b(disabled|invisible|opacity-0|cursor-not-allowed|bg-button-disabled)\b/.test(cls)) return true;
+        return false;
+      } catch (_) {
+        return false;
+      }
+    },
+
     /** Dispatch Enter keydown/keypress/keyup on the composer (send fallback). */
     pressEnter(el) {
       if (!el) return false;

@@ -40,8 +40,13 @@ const els = {
 
   aiSelect: $("aiSelect"),
   newChatEvery: $("newChatEvery"),
-  delayBetween: $("delayBetween"),
+  delayMinMs: $("delayMinMs"),
+  delayMaxMs: $("delayMaxMs"),
   responseTimeout: $("responseTimeout"),
+
+  // Phase 4: connection status bar (green/yellow/red dot + label)
+  connDot: $("connectionDot"),
+  connText: $("connectionText"),
 
   btnStart: $("btnStart"),
   btnPause: $("btnPause"),

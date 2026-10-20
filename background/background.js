@@ -64,6 +64,24 @@ const STATE_KEY = "swayam_state";
 const CONFIG_KEY = "swayam_config";
 const MAX_PROMPTS = 500;
 
+/* ------------------- Randomized human-like delay (Phase 4) --------------
+   Fixed delays look robotic. The engine now picks a UNIFORM random duration
+   between DELAY_MIN_MS and DELAY_MAX_MS before each prompt via chrome.alarms
+   (still no setTimeout/setInterval scheduling in the SW). Override from the
+   popup with settings.delayMinMs / settings.delayMaxMs. */
+const DELAY_MIN_MS = 3000;
+const DELAY_MAX_MS = 7000;
+
+function randomDelayMs() {
+  const raw = S && S.settings ? S.settings : {};
+  let min = Number(raw.delayMinMs);
+  let max = Number(raw.delayMaxMs);
+  if (!Number.isFinite(min) || min < 1000) min = DELAY_MIN_MS;
+  if (!Number.isFinite(max) || max < min) max = Math.max(min, DELAY_MAX_MS);
+  if (max > 600000) max = 600000; // sanity clamp: 10 minutes
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
 // Run states (spec): IDLE, RUNNING, PAUSED, STOPPED, COMPLETED, RETRYING_FAILED
 // WAITING_LOGIN is an internal sub-state of PAUSED used by the auto-resume alarm.
 const STATUS = Object.freeze({
@@ -92,7 +110,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   ai: "chatgpt",
   chatStrategy: "single",   // "single" | "new-chat"
   newChatEvery: 25,
-  delayBetween: 3000,       // ms between prompts
+  delayMinMs: DELAY_MIN_MS, // Phase 4: randomized human-like delay lower bound
+  delayMaxMs: DELAY_MAX_MS, // upper bound (engine picks uniform random in [min,max])
   responseTimeout: 120,     // seconds to wait for RESPONSE_CAPTURED
 });
 
@@ -363,7 +382,7 @@ async function runNext() {
  */
 async function delayedDispatch() {
   S.phase = PHASE.DELAY;
-  const when = Date.now() + Math.max(0, Number(S.settings.delayBetween) || 0);
+  const when = Date.now() + randomDelayMs(); // Phase 4: randomized 3–7 s
   await persistState();
   broadcastState();
   await scheduleStepAlarm(when);
@@ -810,11 +829,60 @@ function revokeQuietly(blobUrl) {
 
 /* ------------------------ Content-script events ------------------------ */
 
+/**
+ * Phase 5.1 — Smart "Bad Response" heuristic. Some AI replies come back as
+ * near-empty strings or canned refusals. Those are treated as FAILURES so the
+ * prompt lands in retryQueue and is re-attempted during the final pass.
+ */
+const BAD_RESPONSE_PHRASES = [
+  "i cannot answer",
+  "i can't answer",
+  "i cannot help with",
+  "i can't help with",
+  "as an ai language model",
+  "as an ai assistant",
+  "i'm sorry, but",
+  "sorry, i can",
+];
+const BAD_RESPONSE_MIN_LEN = 15; // trim().length below this => bad
+
+function isBadResponse(text) {
+  const t = String(text || "").trim();
+  if (t.length < BAD_RESPONSE_MIN_LEN) return "empty_or_too_short";
+  const lower = t.toLowerCase();
+  for (const phrase of BAD_RESPONSE_PHRASES) {
+    if (lower.includes(phrase)) return "refusal_detected";
+  }
+  return null; // good response
+}
+
 async function onResponseCaptured(index, text) {
   if (!S) return;
   const item = S.items[index];
   // Guard against stale/duplicate messages: only accept the in-flight prompt.
   if (!item || S.currentIndex !== index || S.phase !== PHASE.SENDING) return;
+
+  const badReason = isBadResponse(text);
+  if (badReason) {
+    // Mark FAILED (not done) so enterRetryPhase()/retryQueue picks it up at
+    // the very end. Keep the captured text for user visibility.
+    item.response = String(text || "");
+    failItem(index, `Bad response (${badReason}): "${String(text || "").slice(0, 80)}"`);
+    S.currentIndex = -1;
+    S.phase = PHASE.IDLE;
+    if (S.status === STATUS.RETRYING_FAILED && S.retryQueue.length) S.retryQueue.shift();
+    chrome.alarms.clear(ALARM_STEP);
+    if (S.status === STATUS.PAUSED || S.status === STATUS.STOPPED) {
+      S.deadline = 0;
+      await persistState();
+      broadcastState();
+      return;
+    }
+    await persistState();
+    broadcastState();
+    await advanceAfterFailure();
+    return;
+  }
 
   item.status = "done";
   item.response = String(text || "");
@@ -1014,6 +1082,110 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
+/* ------------------- Phase 4: connection status probe ------------------- */
+
+/**
+ * Answer the popup's "am I connected to the selected AI?" question:
+ *   green  = tab open + content script alive + logged in
+ *   yellow = engine is actively processing (RUNNING / RETRYING_FAILED)
+ *   red    = no usable tab, dead content script, or not logged in
+ * Never mutates run state; purely a read-only snapshot for the UI.
+ */
+async function getConnectionStatus() {
+  const settings = S ? S.settings : await loadSettings();
+  const ai = settings.ai || DEFAULT_SETTINGS.ai;
+  const status = S ? S.status : STATUS.IDLE;
+  const active = status === STATUS.RUNNING || status === STATUS.RETRYING_FAILED;
+
+  // While processing, report yellow regardless of probe noise — the engine
+  // IS talking to the page, so a transient CHECK_LOGIN hiccup must not flip
+  // the indicator to red mid-run.
+  if (active) {
+    return { ok: true, color: "yellow", label: "Processing…", ai, status };
+  }
+
+  let tab = null;
+  try { tab = await findTargetTab(ai); } catch (_) { /* ignore */ }
+  if (!tab) {
+    return { ok: true, color: "red", label: "Not Connected", ai, status, reason: "no_tab" };
+  }
+
+  // Make sure the content script exists (inject fallback for tabs opened
+  // before installation / after extension reload).
+  let alive = await contentScriptAlive(tab.id);
+  if (!alive) {
+    try {
+      await chrome.scripting.executeScript({
+        files: [
+          "content-scripts/adapters/adapter-utils.js",
+          "content-scripts/adapters/chatgpt-adapter.js",
+          "content-scripts/adapters/gemini-adapter.js",
+          "content-scripts/adapters/claude-adapter.js",
+          "content-scripts/content-script.js",
+        ],
+        target: { tabId: tab.id },
+      });
+      alive = await contentScriptAlive(tab.id);
+    } catch (err) {
+      console.warn("[Swayam BG] Status probe injection failed:", err);
+      alive = false;
+    }
+  }
+  if (!alive) {
+    return { ok: true, color: "red", label: "Not Connected", ai, status, reason: "no_content_script" };
+  }
+
+  let loggedIn = false;
+  let challenged = false;
+  try {
+    const res = await chrome.tabs.sendMessage(tab.id, { type: "CHECK_LOGIN" });
+    loggedIn = !!(res && res.loggedIn);
+    challenged = !!(res && res.challenged);
+  } catch (_) { /* treat as not connected */ }
+
+  if (loggedIn) {
+    return { ok: true, color: "green", label: `Connected to ${siteName(ai)}`, ai, status };
+  }
+  return {
+    ok: true,
+    color: "red",
+    label: challenged ? "Blocked – manual action needed" : "Not Connected",
+    ai, status,
+    reason: challenged ? "challenge" : "not_logged_in",
+  };
+}
+
+function siteName(ai) {
+  return ai === "gemini" ? "Gemini" : ai === "claude" ? "Claude" : "ChatGPT";
+}
+
+/* ----------------- Phase 4: keyboard shortcut toggle ------------------- */
+
+/**
+ * Ctrl+Space (global command): RUNNING <-> PAUSED. IDLE/COMPLETED/STOPPED do
+ * nothing. WAITING_LOGIN behaves like PAUSED (attempt resume by probing login).
+ */
+async function togglePauseResume() {
+  await ensureInit();
+  const st = S ? S.status : STATUS.IDLE;
+  if (st === STATUS.RUNNING || st === STATUS.RETRYING_FAILED) {
+    console.log("[Swayam BG] toggle-pause-resume -> pausing");
+    return pauseRun();
+  }
+  if (st === STATUS.PAUSED || st === STATUS.WAITING_LOGIN) {
+    console.log("[Swayam BG] toggle-pause-resume -> resuming");
+    return resumeRun();
+  }
+  return { ok: false, error: `Nothing to toggle (status=${st})` };
+}
+
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener((command) => {
+    if (command !== "toggle-pause-resume") return;
+    togglePauseResume().catch((err) => console.error("[Swayam BG] toggle failed:", err));
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return false;
 
@@ -1022,6 +1194,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   (async () => {
     await ensureInit();
+
+    /* ---- Phase 4: connection status probe (popup asks before mutating) ---
+       GET_CONNECTION_STATUS must NOT run the generic state-refresh below so
+       it stays fast and side-effect free. */
+    if (message.type === "GET_CONNECTION_STATUS") {
+      sendResponse(await getConnectionStatus());
+      return;
+    }
 
     // SW-eviction semantics: a freshly woken worker has a stale in-memory
     // mirror until initStateFromStorage() runs — and even after init, another

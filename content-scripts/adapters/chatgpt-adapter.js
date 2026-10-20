@@ -80,13 +80,28 @@
       { css: "button", text: ["new chat"] },
     ],
 
-    // Login / auth wall indicators. If ANY matches while no composer exists
-    // -> NOT_LOGGED_IN.
+    // Positive logged-in signals — checked FIRST by checkLogin(). The composer
+    // is the primary one; the sidebar/user menu (avatar) catches pages where
+    // the composer has not mounted yet but the session is clearly active.
+    loggedInSignals: [
+      "#prompt-textarea",
+      'textarea[aria-label="Prompt"]',
+      'div[contenteditable="true"][role="textbox"]',
+      '[data-testid="sidebar-user-menu"]',
+      '[data-testid="profile-image"]',
+      'button[aria-label="Open user menu"]',
+    ],
+
+    // Login / auth wall indicators. If ANY of these is visible, we report
+    // NOT_LOGGED_IN even if a composer-like element also matched (the landing
+    // page shows its own prompt box next to a "Log in" CTA).
     loginWall: [
       'button[aria-label="Log in"]',
-      'a[href*="/login"]',
-      'a[href*="auth/login"]',
+      'a[href*="/auth/login"]',
+      'a[href*="/sign-up"]',
+      'a[href*="/register"]',
       'button[data-testid="login-button"]',
+      { css: "button,a", text: ["log in", "sign up", "sign in"] },
       { css: "h1,h2", text: ["sign in", "log in", "get started", "choose how you want to use"] },
     ],
 
@@ -112,6 +127,18 @@
 
   function generationRunning() {
     return !!U().queryVisible(document, SELECTORS.stopGeneratingButton);
+  }
+
+  /**
+   * How long to wait (ms) for the send button to become enabled after the
+   * composer text was registered. Phase 4: the first prompt used to fail
+   * because we clicked while React still had the button disabled.
+   */
+  const SEND_ENABLE_TIMEOUT_MS = 5000;
+
+  /** Small async sleep helper (content scripts may use timers freely). */
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -161,25 +188,104 @@
     site: "chatgpt",
 
     checkLogin() {
-      // Composer present => the app shell loaded => logged in.
-      if (findComposer()) return { loggedIn: true, challenged: false };
-      // Cloudflare / bot challenge => user must interact manually.
+      // 1) Cloudflare / bot challenge => user must interact manually.
       if (U().queryFirst(document, SELECTORS.challengeWall)) {
         return { loggedIn: false, challenged: true };
       }
-      // Auth wall (login prompt) or simply no composer => not usable right now.
+
+      // 2) Auth wall visible ("Log in" CTA etc.) => NOT_LOGGED_IN, even when a
+      //    composer-like element also matched: ChatGPT's landing page renders
+      //    its own prompt box next to login/signup buttons.
+      if (U().queryVisible(document, SELECTORS.loginWall)) {
+        return { loggedIn: false, challenged: false };
+      }
+
+      // 3) Positive logged-in signals: working composer OR the sidebar user
+      //    menu / avatar (session active while the app shell still mounts).
+      const composer = findComposer();
+      if (composer && !U().queryVisible(document, SELECTORS.loginWall)) {
+        return { loggedIn: true, challenged: false };
+      }
+      if (U().queryFirst(document, SELECTORS.loggedInSignals)) {
+        return { loggedIn: true, challenged: false };
+      }
+
+      // Nothing usable yet.
       return { loggedIn: false, challenged: false };
     },
 
     /**
      * Insert `text` into the composer and press send.
      * Resolves { ok, error? }. Does NOT wait for the response.
+     *
+     * Phase 4 fix (first-prompt failure on ChatGPT): after the native setter
+     * trick fills the textarea, React needs a tick to re-render and ENABLE the
+     * send button (it is disabled while its internal state thinks the composer
+     * is empty). We therefore:
+     *   1. focus the composer first (ChatGPT's handlers expect it),
+     *   2. write via the HTMLTextAreaElement native value setter + input event,
+     *   3. POLL up to SEND_ENABLE_TIMEOUT_MS for the send button to become
+     *      enabled (`disabled` attr / aria-disabled / disabled-style classes),
+     *   4. click it once enabled; if it never enables within the window we do
+     *      NOT fail outright yet — Enter keydown is tried as a fallback —
+     *      and only then return a failure so the engine can mark/skip/retry.
      */
     async sendPrompt(text) {
-      const composer = await U().waitFor(findComposer, { timeoutMs: 15000, intervalMs: 300 });
+      // Phase 5.1 hotfix — exact targeting per spec: the ChatGPT composer is
+      // either a <textarea> (inside the prompt <form>) or a contenteditable
+      // div. findComposer() already covers both; this line documents intent.
+      const composer = await U().waitFor(
+        () => document.querySelector("form textarea") ||
+              document.querySelector('div[contenteditable="true"]') ||
+              findComposer(),
+        { timeoutMs: 15000, intervalMs: 300 }
+      );
       if (!composer) return { ok: false, error: "composer_not_found" };
 
-      if (!U().setText(composer, text)) return { ok: false, error: "composer_fill_failed" };
+      // 1) Focus FIRST — React handlers on ChatGPT's composer expect focus
+      //    before programmatic value changes are registered.
+      try { composer.focus(); } catch (_) { /* non-fatal */ }
+
+      // 2) Clear any residual text so the native setter starts from empty
+      //    (stale drafts caused the first-prompt failure).
+      try {
+        if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+          U().setNativeValue(composer, "");
+        } else if (composer.isContentEditable) {
+          composer.textContent = "";
+        }
+      } catch (_) { /* non-fatal */ }
+
+      // 3) Insert text using the React-bypass method:
+      //    - textarea  -> HTMLTextAreaElement.prototype native value setter
+      //                    + input/change events (forces React state update)
+      //    - contenteditable -> document.execCommand("insertText", ...) which
+      //                    fires the correct beforeinput/input InputEvents
+      //                    that React contenteditables listen to.
+      let filled = false;
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        filled = U().setNativeValue(composer, text);
+      } else if (composer.isContentEditable) {
+        try {
+          composer.focus();
+          filled = document.execCommand("insertText", false, text);
+          if (!filled || !(composer.textContent || "").includes(text.slice(0, 20))) {
+            // execCommand unsupported/blocked -> manual DOM write + events.
+            composer.textContent = text;
+            composer.dispatchEvent(new InputEvent("input", {
+              bubbles: true, cancelable: true, inputType: "insertText", data: text,
+            }));
+            filled = true;
+          }
+        } catch (_) { filled = false; }
+      }
+      if (!filled) return { ok: false, error: "composer_fill_failed" };
+
+      // 4) Dispatch events to force React to update its internal state.
+      try {
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+        composer.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (_) { /* non-fatal */ }
 
       // Verify the app registered our text before sending.
       const registered = await U().waitFor(() => {
@@ -190,14 +296,42 @@
       }, { timeoutMs: 3000, intervalMs: 100 });
       if (!registered) return { ok: false, error: "composer_text_not_registered" };
 
-      const btn = U().queryVisible(composer.closest("form") || document, SELECTORS.sendButton) ||
-                  U().queryVisible(document, SELECTORS.sendButton);
+      // 6) Wait ~500 ms for the UI to settle and enable the send button, then
+      //    poll up to SEND_ENABLE_TIMEOUT_MS (5 s) for it to become clickable.
+      await sleep(500);
+      const scope = () => composer.closest("form") || document;
+      let btn = null;
+      const deadline = Date.now() + SEND_ENABLE_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const candidate =
+          U().queryVisible(scope(), SELECTORS.sendButton) ||
+          U().queryVisible(document, SELECTORS.sendButton);
+        if (candidate && !U().isDisabledLike(candidate)) { btn = candidate; break; }
+        await sleep(150);
+      }
+
+      // 7) Click the send button directly (more reliable than pressing Enter).
       if (btn) {
         U().realClick(btn);
         return { ok: true };
       }
-      // Fallback: Enter keydown on the composer.
-      if (U().pressEnter(composer)) return { ok: true };
+
+      // Button never enabled within 5 s -> fallback: Enter keydown on the
+      // composer (ChatGPT submits on Enter when the model accepts it).
+      if (U().pressEnter(composer)) {
+        // Confirm something actually happened: composer cleared OR generation
+        // started (stop button appeared) within a short grace window.
+        const sent = await U().waitFor(() => {
+          const v = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+            ? composer.value
+            : composer.textContent;
+          const cleared = !v || v.trim().length === 0;
+          return cleared || generationRunning() ? true : null;
+        }, { timeoutMs: 4000, intervalMs: 200 });
+        if (sent) return { ok: true };
+        return { ok: false, error: "send_button_never_enabled" };
+      }
+
       return { ok: false, error: "send_control_not_found" };
     },
 

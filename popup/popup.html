@@ -24,6 +24,13 @@
 
   <main class="app-main">
 
+    <!-- ============ CONNECTION STATUS BAR (Phase 4) ============ -->
+    <div class="conn-bar" id="connectionBar" role="status" aria-live="polite">
+      <span id="connectionDot" class="conn-dot unknown"></span>
+      <span id="connectionText" class="conn-text">Checking connection…</span>
+      <button id="btnRefreshConn" class="btn btn-ghost btn-sm" title="Re-check tab + login status">↻</button>
+    </div>
+
     <!-- ============ STEP 1: FILE UPLOAD ============ -->
     <section class="card" id="sectionUpload">
       <h2 class="card-title"><span class="step-badge">1</span> Upload Prompts</h2>
@@ -88,15 +95,21 @@
         <summary>Advanced settings</summary>
         <div class="field-row">
           <div class="field">
-            <label for="delayBetween">Delay between prompts (ms)</label>
-            <input type="number" id="delayBetween" class="input" min="1000" step="500" value="3000" />
+            <label for="delayMinMs">Random delay min (ms)</label>
+            <input type="number" id="delayMinMs" class="input" min="1000" step="500" value="3000" />
           </div>
+          <div class="field">
+            <label for="delayMaxMs">Random delay max (ms)</label>
+            <input type="number" id="delayMaxMs" class="input" min="1000" step="500" value="7000" />
+          </div>
+        </div>
+        <div class="field-row">
           <div class="field">
             <label for="responseTimeout">Response timeout (s)</label>
             <input type="number" id="responseTimeout" class="input" min="10" step="5" value="120" />
           </div>
         </div>
-        <small class="hint">Failed / timed-out prompts are skipped during the run and retried automatically at the very end.</small>
+        <small class="hint">The engine waits a random pause between min and max before each prompt (human-like pacing). Failed / timed-out prompts are skipped during the run and retried automatically at the very end. Shortcut: Ctrl+Space pauses/resumes the queue.</small>
       </details>
     </section>
 
@@ -165,7 +178,9 @@
   </main>
 
   <footer class="app-footer">
+    <p class="tip-line">💡 Tip: Use Ctrl+Space to Pause/Resume</p>
     <p>100% local &middot; No APIs &middot; No telemetry &middot; State saved via <code>chrome.storage.local</code> for crash recovery</p>
+    <p class="dev-credit">Developed by <a href="https://github.com/Be2CNO/Swayam" target="_blank" rel="noopener noreferrer">Be2CNO</a> | <a href="https://github.com/Be2CNO/Swayam" target="_blank" rel="noopener noreferrer">View on GitHub</a></p>
   </footer>
 
   <script src="popup.js"></script>
