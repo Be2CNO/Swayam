@@ -121,27 +121,38 @@
     if (currentJob === job && job.aborted) { currentJob = null; return; }
 
     // 2) Wait until a NEW assistant message appears (or the last one changes).
+    //    EMERGENCY FIX: only REAL answer text counts as "started" — empty
+    //    shells and thinking placeholders must NOT flip this early, otherwise
+    //    observeResponse's WAITING_FOR_START phase gets seeded incorrectly.
     const appeared = await utils.waitFor(() => {
       const nodes = document.querySelectorAll(
         (adapter.SELECTORS.assistantMessageNodes || []).join(", ")
       );
       if (!nodes.length) return null;
       const last = nodes[nodes.length - 1];
+      const txt = String(last.innerText || "").replace(/\u00a0/g, " ").trim();
+      if (!txt) return null;
       const grew = nodes.length > prevCount;
-      const changed = !grew && utils.extractText(last) !== prevLastText;
+      const changed = !grew && txt !== prevLastText;
       return grew || changed ? last : null;
     }, { timeoutMs: 45000, intervalMs: 500 });
 
     if (job.aborted) { currentJob = null; return; }
     if (!appeared) {
-      postToBackground({ type: "RESPONSE_FAILED", index, error: "response_never_started" });
+      postToBackground({ type: "RESPONSE_FAILED", index, error: "ai_did_not_start" });
       currentJob = null;
       return;
     }
 
-    // 3) Completion detection (MutationObserver + signals inside the adapter).
+    // 3) Completion detection (generation state machine inside the adapter).
+    //    settleMs 2000: quiet-window before COMPLETED; startTimeoutMs is
+    //    handled by step 2 above (45 s to produce any real text).
     const hardMs = Math.max(10, Number(timeoutSeconds) || 120) * 1000;
-    const result = await adapter.observeResponse({ settleMs: 2500, hardTimeoutMs: hardMs });
+    const result = await adapter.observeResponse({
+      settleMs: 2000,
+      hardTimeoutMs: hardMs,
+      startTimeoutMs: 45000,
+    });
 
     if (!job.aborted && currentJob === job) {
       if (result && result.ok) {

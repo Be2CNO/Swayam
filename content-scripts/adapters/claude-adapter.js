@@ -104,34 +104,44 @@
     return !!clickable;
   }
 
-  function detectCompletion(prevCount, quietForMs, settleMs) {
-    // Signal #2 — copy affordance on the newest answer node (independent of
-    // generation state; first match wins).
-    const nodesNow = Array.from(answerNodes());
-    if (nodesNow.length > prevCount) {
-      const lastNew = nodesNow[nodesNow.length - 1];
-      if (lastNew && U().queryFirst(lastNew, SELECTORS.copyButtonInLastMessage)) {
-        return lastNew;
-      }
+  /** True when `el` visibly contains streaming/thinking placeholder text. */
+  const THINKING_RE = /\b(thinking|deep in thought|analyzing|generating|searching|browsing|pondering)\b/i;
+  function looksLikeThinking(el) {
+    if (!el) return false;
+    try {
+      const txt = String(el.innerText || el.textContent || "").trim();
+      return txt.length > 0 && txt.length <= 80 && THINKING_RE.test(txt);
+    } catch (_) {
+      return false;
     }
+  }
 
-    // While generation is still running nothing else can be "done".
-    if (generationRunning()) return null;
+  function detectCompletion(ctx) {
+    // EMERGENCY FIX — generation STATE MACHINE (mirrors chatgpt-adapter.js).
+    // Completion is evaluated in ONE place (observeResponse's poller):
+    //   WAITING_FOR_START -> GENERATING only when REAL answer text appears,
+    //   GENERATING -> COMPLETED only after `settleMs` of DOM quiet AND the
+    //   stop control is gone. Fixes premature/empty captures during Claude's
+    //   thinking delay.
+    const { prevCount, prevLastText, startedAt, settleMs } = ctx;
 
-    // Signal #1 — stop button gone + a new (or newly non-empty) answer exists.
+    if (Date.now() - startedAt < 2500) return null;      // pre-typing grace window
+    if (generationRunning()) return null;                // still generating
+
+    const nodesNow = Array.from(answerNodes());
     if (!nodesNow.length) return null;
     const last = nodesNow[nodesNow.length - 1];
-    const txt = (last.innerText || "").trim();
-    const isNew = nodesNow.length > prevCount;
-    if (isNew && txt.length > 0) return last;
 
-    // Signal #3 — same-node regeneration: only trust after `settleMs` quiet.
-    if (!isNew && txt.length > 0 &&
-        typeof quietForMs === "number" && typeof settleMs === "number" &&
-        quietForMs >= settleMs) {
-      return last;
-    }
-    return null;
+    const grew = nodesNow.length > prevCount;
+    const txt = String(last.innerText || "").replace(/\u00a0/g, " ").trim();
+
+    if (txt && looksLikeThinking(last)) return null;     // placeholder, not an answer
+    if (prevLastText && txt === prevLastText && !(ctx.sawStop && grew)) return null;
+    if (!txt) return null;                               // no real text yet
+    if (Date.now() - Math.max(ctx.textSeenAt, ctx.lastMutationAt) < settleMs) return null;
+
+    void settleMs;
+    return last;
   }
 
   const adapter = {
@@ -176,53 +186,125 @@
     },
 
     observeResponse(opts) {
-      const o = Object.assign({ settleMs: 2500, hardTimeoutMs: 120000 }, opts || {});
+      const o = Object.assign(
+        { settleMs: 2000, hardTimeoutMs: 120000, startTimeoutMs: 15000 },
+        opts || {}
+      );
       return new Promise((resolve) => {
-        const container = U().queryFirst(document, SELECTORS.conversationContainer) || document.body;
-        const prevCount = answerNodes().length;
+        // Attach ONLY to the chat history container — never the composer/input.
+        let container = U().queryFirst(document, SELECTORS.conversationContainer);
+        if (!container || container === document.body) {
+          container = document.querySelector("main") || document.body;
+        }
+
+        const startNodes = Array.from(answerNodes());
+        const prevCount = startNodes.length;
+        const prevLastText = prevCount
+          ? String(startNodes[prevCount - 1].innerText || "").replace(/\u00a0/g, " ").trim()
+          : "";
+
+        // ---- State machine -------------------------------------------------
+        const STATE = { WAITING_FOR_START: 1, GENERATING: 2, COMPLETED: 3 };
+        const ctx = {
+          prevCount, prevLastText,
+          startedAt: Date.now(),
+          sawStop: false,
+          lastMutationAt: Date.now(),
+          textSeenAt: 0,
+          settleMs: o.settleMs,
+        };
+
+        // Live "real answer" detector: non-empty, not a thinking placeholder,
+        // and genuinely OUR new reply (node grew, or generation was witnessed).
+        const currentAnswerNode = () => {
+          const nodesNow = Array.from(answerNodes());
+          if (!nodesNow.length) return null;
+          const last = nodesNow[nodesNow.length - 1];
+          const txt = String(last.innerText || "").replace(/\u00a0/g, " ").trim();
+          if (!txt) return null;
+          if (looksLikeThinking(last)) return null;
+          const grew = nodesNow.length > prevCount;
+          if (prevLastText && txt === prevLastText) {
+            if (!(ctx.sawStop && grew)) return null;
+          } else if (!grew && !ctx.sawStop) {
+            return null;
+          }
+          return last;
+        };
+
+        let phase = STATE.WAITING_FOR_START;
+        if (generationRunning()) {
+          ctx.sawStop = true;
+          phase = STATE.GENERATING;
+          ctx.textSeenAt = Date.now();
+        } else if (currentAnswerNode()) {
+          phase = STATE.GENERATING;
+          ctx.textSeenAt = Date.now();
+          ctx.lastMutationAt = Date.now();
+        }
 
         let finished = false;
-        let lastMutationAt = Date.now();
-        let generationStarted = false; // saw the stop control after send
-        let observer = null, poller = null, hardTimer = null;
+        let observer = null, poller = null, hardTimer = null, startTimer = null;
 
+        const cleanup = () => {
+          try { observer && observer.disconnect(); } catch (_) {}
+          observer = null;
+          poller && clearInterval(poller);
+          hardTimer && clearTimeout(hardTimer);
+          startTimer && clearTimeout(startTimer);
+        };
         const finish = (node) => {
           if (finished) return;
-          finished = true; cleanup();
+          finished = true;
+          phase = STATE.COMPLETED;
+          cleanup();
           resolve({ ok: true, text: U().extractText(node) });
         };
         const fail = (reason) => {
           if (finished) return;
-          finished = true; cleanup();
+          finished = true;
+          cleanup();
           resolve({ ok: false, error: reason });
         };
-        const cleanup = () => {
-          try { observer && observer.disconnect(); } catch (_) {}
-          poller && clearInterval(poller);
-          hardTimer && clearTimeout(hardTimer);
-        };
 
+        // SAFETY: read-only observation. Never clicks anything (certainly not
+        // the stop control). Completion decided only in the poller below.
         observer = new MutationObserver(() => {
-          lastMutationAt = Date.now();
-          const done = detectCompletion(prevCount, Date.now() - lastMutationAt, o.settleMs);
-          if (done) finish(done);
+          ctx.lastMutationAt = Date.now();
         });
         observer.observe(container, { childList: true, subtree: true, characterData: true });
 
         poller = setInterval(() => {
-          if (generationRunning()) generationStarted = true;
-          const quietFor = Date.now() - lastMutationAt;
-          const done = detectCompletion(prevCount, quietFor, o.settleMs);
-          if (done) return finish(done);
-          // Signal #3 fallback when answer count didn't change (regen/edit):
-          // require that generation was actually seen running first.
-          if (generationStarted && !generationRunning() && quietFor >= o.settleMs) {
-            const nodes = answerNodes();
-            const last = nodes.length ? nodes[nodes.length - 1] : null;
-            if (last && (last.innerText || "").trim().length > 0) return finish(last);
-          }
-        }, 400);
+          if (finished) return;
+          if (generationRunning()) ctx.sawStop = true;
 
+          const node = currentAnswerNode();
+
+          if (phase === STATE.WAITING_FOR_START) {
+            if (node) {
+              phase = STATE.GENERATING;   // REAL text appeared => generating
+              ctx.textSeenAt = Date.now();
+              ctx.lastMutationAt = Date.now();
+            }
+            return;
+          }
+
+          if (phase === STATE.GENERATING) {
+            if (generationRunning()) return;   // still streaming
+            if (!node) return;                 // text vanished — keep waiting
+            const quietFor = Date.now() - Math.max(ctx.lastMutationAt, ctx.textSeenAt);
+            if (quietFor >= o.settleMs && Date.now() - ctx.startedAt >= 2500) {
+              finish(node);                    // COMPLETED
+            }
+          }
+        }, 250);
+
+        // Fallback #1: AI never started typing within the start window.
+        startTimer = setTimeout(() => {
+          if (phase === STATE.WAITING_FOR_START) fail("ai_did_not_start");
+        }, o.startTimeoutMs);
+
+        // Fallback #2: global hard timeout (honours SEND_PROMPT timeoutSeconds).
         hardTimer = setTimeout(() => fail("timeout"), o.hardTimeoutMs);
       });
     },

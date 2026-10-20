@@ -130,6 +130,28 @@
   }
 
   /**
+   * SAFETY: this helper is the ONLY place the stop control is ever touched.
+   * It NEVER clicks it — it only reads its presence/absence as a completion
+   * signal. (abortCurrent() below is the sole sanctioned clicker, and only
+   * when the user explicitly pauses/stops via the engine.)
+   */
+  function hasStopButton() {
+    return generationRunning();
+  }
+
+  /** True when `el` visibly contains streaming/thinking placeholder text. */
+  const THINKING_RE = /\b(thinking|deep in thought|analyzing|visualizing|generating|searching|browsing|reflecting|wandering|pondering)\b/i;
+  function looksLikeThinking(el) {
+    if (!el) return false;
+    try {
+      const txt = String(el.innerText || el.textContent || "").trim();
+      return txt.length > 0 && txt.length <= 80 && THINKING_RE.test(txt);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
    * How long to wait (ms) for the send button to become enabled after the
    * composer text was registered. Phase 4: the first prompt used to fail
    * because we clicked while React still had the button disabled.
@@ -150,38 +172,55 @@
    *              (evaluated by observeResponse's poller, not here).
    * Returns the completed node, or null.
    */
-  function detectCompletion(prevCount, quietForMs, settleMs) {
-    // Signal #2 — independent of generation state: copy affordance on the
-    // newest assistant message that wasn't there before this turn.
+  function detectCompletion(ctx) {
+    // EMERGENCY FIX — generation STATE MACHINE. Completion is now evaluated in
+    // exactly ONE place (the poller inside observeResponse), which guarantees:
+    //   * WAITING_FOR_START -> GENERATING only when REAL answer text appears
+    //     (stop-button presence alone never counts as "started"), and
+    //   * GENERATING -> COMPLETED only after the DOM has been quiet for
+    //     `settleMs` AND the stop button is gone.
+    // The previous multi-signal version captured empty/thinking placeholders
+    // the instant the stop button vanished during the AI's pre-typing delay.
+    const { prevCount, prevLastText, startedAt, sawStop, settleMs } = ctx;
+
+    // Never complete before a small grace window after send — covers the
+    // thinking/processing delay where the UI briefly shows no stop button.
+    if (Date.now() - startedAt < 2500) return null;
+
+    // Still generating? (stop control visible => not done, period.)
+    if (hasStopButton()) return null;
+
     const nodesNow = Array.from(
       document.querySelectorAll(SELECTORS.assistantMessageNodes.join(", "))
     );
-    if (nodesNow.length > prevCount) {
-      const lastNew = nodesNow[nodesNow.length - 1];
-      if (lastNew && U().queryFirst(lastNew, SELECTORS.copyButtonInLastMessage)) {
-        return lastNew;
-      }
-    }
+    if (!nodesNow.length) return null;
+    const last = nodesNow[nodesNow.length - 1];
 
-    // While generation is still running nothing else can be "done".
-    if (generationRunning()) return null;
+    const grew = nodesNow.length > prevCount;
+    const txt = String(last.innerText || "").replace(/\u00a0/g, " ").trim();
 
-    // Signal #1 — stop button gone + a new (or newly non-empty) reply exists.
-    const count = nodesNow.length;
-    if (count === 0) return null;
-    const last = nodesNow[count - 1];
-    const txt = (last.innerText || "").trim();
-    const isNew = count > prevCount;
-    if (isNew && txt.length > 0) return last;
+    // Streaming/thinking placeholder ("Thinking…", "Deep in thought…") is NOT
+    // an answer: keep waiting instead of capturing it.
+    if (txt && looksLikeThinking(last)) return null;
 
-    // Signal #3 — same-node regeneration (count unchanged): only trust it once
-    // the subtree has been quiet for settleMs.
-    if (!isNew && txt.length > 0 &&
-        typeof quietForMs === "number" && typeof settleMs === "number" &&
-        quietForMs >= settleMs) {
-      return last;
-    }
-    return null;
+    // A brand-new node whose content equals the previous last reply is just a
+    // re-render artifact, not our response.
+    if (grew && prevLastText && txt === prevLastText) return null;
+
+    // No real text yet => we are still in WAITING_FOR_START.
+    if (!txt) return null;
+
+    // Quiet long enough => COMPLETED. If we ever saw the stop button, its
+    // disappearance already proves generation ended; otherwise require the
+    // full quiet window measured from first-seen-text.
+    const quietSinceStart = Date.now() - Math.max(sawStop ? ctx.lastMutationAt : ctx.textSeenAt, 0);
+    const quietOk = ctx.sawStop
+      ? Date.now() - ctx.textSeenAt >= 400
+      : Date.now() - ctx.textSeenAt >= settleMs;
+    if (!quietOk) return null;
+    void quietSinceStart;
+
+    return last;
   }
 
   const adapter = {
@@ -337,28 +376,121 @@
 
     /**
      * Observe the conversation until the assistant reply is complete.
-     * Resolves with the captured text, or rejects via {ok:false,...} result.
+     * EMERGENCY FIX — generation STATE MACHINE:
+     *
+     *   WAITING_FOR_START  -> AI hasn't produced real answer text yet.
+     *                         (Thinking placeholders / empty nodes do NOT
+     *                         count as started; this was the premature-
+     *                         capture bug.)
+     *   GENERATING         -> real text has appeared; quiet timer resets on
+     *                         every DOM mutation inside the last message node.
+     *   COMPLETED          -> stop button gone AND no mutations for `settleMs`
+     *                         (default 2000ms). Observer disconnected, text
+     *                         extracted, RESPONSE_CAPTURED sent by the router.
+     *
+     * Hard fallbacks:
+     *   - ai_did_not_start : no real text within START_TIMEOUT_MS of send.
+     *   - timeout          : hardTimeoutMs exceeded in any state.
+     *
+     * SAFETY: observation is READ-ONLY. This function never clicks anything,
+     * especially not the "Stop generating" button. The MutationObserver is
+     * attached ONLY to the conversation container (never document.body when a
+     * container resolves, and never the composer/input) and is ALWAYS
+     * disconnected in cleanup() to prevent memory leaks.
      */
     observeResponse(opts) {
-      const o = Object.assign({ settleMs: 2500, hardTimeoutMs: 120000 }, opts || {});
+      const o = Object.assign(
+        { settleMs: 2000, hardTimeoutMs: 120000, startTimeoutMs: 15000 },
+        opts || {}
+      );
       return new Promise((resolve) => {
-        const container =
-          U().queryFirst(document, SELECTORS.conversationContainer) || document.body;
-        const startNodes = document.querySelectorAll(
-          SELECTORS.assistantMessageNodes.join(", ")
+        // Attach ONLY to the chat history container — never the composer/input.
+        // document.body is the absolute last resort (it would also observe the
+        // input box, which caused spurious mutations in earlier versions).
+        let container = U().queryFirst(document, SELECTORS.conversationContainer);
+        if (!container || container === document.body) {
+          container = document.querySelector("main") || document.body;
+        }
+
+        const startNodes = Array.from(
+          document.querySelectorAll(SELECTORS.assistantMessageNodes.join(", "))
         );
         const prevCount = startNodes.length;
+        const prevLastText = prevCount
+          ? String(startNodes[prevCount - 1].innerText || "").replace(/\u00a0/g, " ").trim()
+          : "";
+
+        // ---- State machine -------------------------------------------------
+        const STATE = { WAITING_FOR_START: 1, GENERATING: 2, COMPLETED: 3 };
+
+        const ctx = {
+          prevCount,
+          prevLastText,
+          startedAt: Date.now(),
+          sawStop: false,          // ever saw the stop control this turn
+          lastMutationAt: Date.now(),
+          textSeenAt: 0,           // when REAL answer text first appeared
+          settleMs: o.settleMs,
+        };
+
+        // Live "real answer" detector (shared by seeding + poller). Returns the
+        // last assistant node ONLY when it genuinely contains our new reply:
+        // non-empty, not a thinking placeholder, and not just the previous
+        // reply re-rendered in place.
+        const currentAnswerNode = () => {
+          const nodesNow = Array.from(
+            document.querySelectorAll(SELECTORS.assistantMessageNodes.join(", "))
+          );
+          if (!nodesNow.length) return null;
+          const last = nodesNow[nodesNow.length - 1];
+          const txt = String(last.innerText || "").replace(/\u00a0/g, " ").trim();
+          if (!txt) return null;                       // empty shell
+          if (looksLikeThinking(last)) return null;    // placeholder only
+          const grew = nodesNow.length > prevCount;
+          if (prevLastText && txt === prevLastText) {
+            // Same text as before send: acceptable ONLY if we watched this
+            // very turn generate (stop button seen) — i.e. an identical
+            // regenerated answer. Otherwise it's stale/re-render -> keep waiting.
+            if (!(ctx.sawStop && grew)) return null;
+          } else if (!grew && !ctx.sawStop) {
+            // Different text but no new node and generation never observed:
+            // could be any DOM churn elsewhere — require at least a growth or
+            // a witnessed generation cycle before trusting it.
+            return null;
+          }
+          return last;
+        };
+
+        let phase = STATE.WAITING_FOR_START;
+
+        // Seed the state machine from the DOM: if generation is already
+        // running (stop button visible) or real text already landed before we
+        // attached, skip straight to the right phase so the 15s "did not
+        // start" watchdog can never fire on an in-flight reply.
+        if (hasStopButton()) {
+          ctx.sawStop = true;
+          phase = STATE.GENERATING;
+          ctx.textSeenAt = Date.now();
+        } else if (currentAnswerNode()) {
+          phase = STATE.GENERATING;
+          ctx.textSeenAt = Date.now();
+          ctx.lastMutationAt = Date.now();
+        }
 
         let finished = false;
-        let lastMutationAt = Date.now();
-        let generationStarted = false; // saw the stop button after send
-        let observer = null;
-        let poller = null;
-        let hardTimer = null;
+        let observer = null, poller = null, hardTimer = null, startTimer = null;
 
+        const cleanup = () => {
+          try { observer && observer.disconnect(); } catch (_) {}
+          observer = null;
+          poller && clearInterval(poller);
+          hardTimer && clearTimeout(hardTimer);
+          startTimer && clearTimeout(startTimer);
+        };
         const finish = (node) => {
           if (finished) return;
           finished = true;
+          phase = STATE.COMPLETED;
           cleanup();
           resolve({ ok: true, text: U().extractText(node) });
         };
@@ -368,38 +500,51 @@
           cleanup();
           resolve({ ok: false, error: reason });
         };
-        const cleanup = () => {
-          try { observer && observer.disconnect(); } catch (_) {}
-          poller && clearInterval(poller);
-          hardTimer && clearTimeout(hardTimer);
-        };
+
+        // NOTE: currentAnswerNode() is defined ABOVE (before the seeding block)
+        // so the state machine can be seeded from it as well.
 
         observer = new MutationObserver(() => {
-          lastMutationAt = Date.now();
-          const done = detectCompletion(prevCount, Date.now() - lastMutationAt, o.settleMs);
-          if (done) finish(done);
+          ctx.lastMutationAt = Date.now();
+          // In GENERATING we deliberately do NOT complete here — completion is
+          // decided solely by the poller's quiet-window check so that thinking
+          // pauses mid-stream can never end the capture early.
         });
         observer.observe(container, { childList: true, subtree: true, characterData: true });
 
-        // Poll: handles (a) instant answers where mutations settled before we
-        // attached, and (b) completion signal #3 — no DOM mutation inside the
-        // last message node for `settleMs`.
         poller = setInterval(() => {
-          if (generationRunning()) generationStarted = true;
-          const quietFor = Date.now() - lastMutationAt;
-          const done = detectCompletion(prevCount, quietFor, o.settleMs);
-          if (done) return finish(done);
-          // Signal #3 fallback when message count didn't change (edit/regen):
-          // require that generation was actually seen running first.
-          if (generationStarted && !generationRunning() && quietFor >= o.settleMs) {
-            const nodes = document.querySelectorAll(
-              SELECTORS.assistantMessageNodes.join(", ")
-            );
-            const last = nodes.length ? nodes[nodes.length - 1] : null;
-            if (last && (last.innerText || "").trim().length > 0) return finish(last);
-          }
-        }, 400);
+          if (finished) return;
+          if (hasStopButton()) ctx.sawStop = true;
 
+          const node = currentAnswerNode();
+
+          if (phase === STATE.WAITING_FOR_START) {
+            if (node) {
+              // Text actually appeared => GENERATING. Reset the quiet timer.
+              phase = STATE.GENERATING;
+              ctx.textSeenAt = Date.now();
+              ctx.lastMutationAt = Date.now();
+            }
+            return;
+          }
+
+          if (phase === STATE.GENERATING) {
+            // Completion requires: stop button gone AND DOM quiet for settleMs.
+            if (hasStopButton()) return;
+            if (!node) return; // text vanished (re-render) — keep waiting
+            const quietFor = Date.now() - Math.max(ctx.lastMutationAt, ctx.textSeenAt);
+            if (quietFor >= o.settleMs && Date.now() - ctx.startedAt >= 2500) {
+              finish(node);
+            }
+          }
+        }, 250);
+
+        // Fallback #1: AI never started typing within the start window.
+        startTimer = setTimeout(() => {
+          if (phase === STATE.WAITING_FOR_START) fail("ai_did_not_start");
+        }, o.startTimeoutMs);
+
+        // Fallback #2: global hard timeout (honours SEND_PROMPT timeoutSeconds).
         hardTimer = setTimeout(() => fail("timeout"), o.hardTimeoutMs);
       });
     },
