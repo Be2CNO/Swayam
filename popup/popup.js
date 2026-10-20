@@ -21,6 +21,7 @@
 const MAX_PROMPTS = 500;
 const STORAGE_KEYS = {
   config: "swayam_config",
+  state: "swayam_state", // engine run-state mirror (used for live UI refresh)
 };
 
 /* --------------------------- DOM references --------------------------- */
@@ -47,6 +48,7 @@ const els = {
   // Phase 4: connection status bar (green/yellow/red dot + label)
   connDot: $("connectionDot"),
   connText: $("connectionText"),
+  btnRefreshConn: $("btnRefreshConn"),
 
   btnStart: $("btnStart"),
   btnPause: $("btnPause"),
@@ -361,9 +363,14 @@ async function saveConfig() {
     ai: els.aiSelect.value,
     chatStrategy: strategy ? strategy.value : "single",
     newChatEvery: clampInt(els.newChatEvery.value, 1, MAX_PROMPTS, 25),
-    delayBetween: clampInt(els.delayBetween.value, 1000, 600000, 3000),
+    // BUGFIX: `els.delayBetween` never existed (Phase 4 replaced the single
+    // delay input with min/max) — this threw a TypeError on every Start click
+    // and silently prevented ALL settings from being saved.
+    delayMinMs: clampInt(els.delayMinMs.value, 1000, 600000, 3000),
+    delayMaxMs: clampInt(els.delayMaxMs.value, 1000, 600000, 7000),
     responseTimeout: clampInt(els.responseTimeout.value, 10, 3600, 120),
   };
+  if (config.delayMaxMs < config.delayMinMs) config.delayMaxMs = config.delayMinMs;
   try {
     await chrome.storage.local.set({ [STORAGE_KEYS.config]: config });
   } catch (err) {
@@ -382,7 +389,9 @@ async function loadConfig() {
       if (radio) radio.checked = true;
     }
     if (typeof cfg.newChatEvery === "number") els.newChatEvery.value = String(cfg.newChatEvery);
-    if (typeof cfg.delayBetween === "number") els.delayBetween.value = String(cfg.delayBetween);
+    // BUGFIX: was reading/writing the nonexistent `delayBetween` element.
+    if (typeof cfg.delayMinMs === "number") els.delayMinMs.value = String(cfg.delayMinMs);
+    if (typeof cfg.delayMaxMs === "number") els.delayMaxMs.value = String(cfg.delayMaxMs);
     if (typeof cfg.responseTimeout === "number") els.responseTimeout.value = String(cfg.responseTimeout);
   } catch (err) {
     console.error("[Swayam Popup] Failed loading config:", err);
@@ -477,13 +486,20 @@ function bindEvents() {
   els.btnRemoveFile.addEventListener("click", clearFile);
 
   // Config persistence (the engine picks these up on the next START_RUN)
-  [els.aiSelect, els.newChatEvery, els.delayBetween, els.responseTimeout]
+  [els.aiSelect, els.newChatEvery, els.delayMinMs, els.delayMaxMs, els.responseTimeout]
     .forEach((el) => el.addEventListener("change", saveConfig));
   document.querySelectorAll('input[name="chatStrategy"]')
     .forEach((r) => r.addEventListener("change", saveConfig));
 
   // Run controls -> background engine
   els.btnStart.addEventListener("click", onStart);
+  if (els.btnRefreshConn) {
+    els.btnRefreshConn.addEventListener("click", () => {
+      els.connDot.className = "conn-dot unknown";
+      els.connText.textContent = "Checking connection…";
+      updateConnectionStatus();
+    });
+  }
   els.btnPause.addEventListener("click", () => onControl("PAUSE_RUN"));
   els.btnStop.addEventListener("click", () => onControl("STOP_RUN"));
   els.btnResume.addEventListener("click", () => onControl("RESUME_RUN"));
@@ -509,8 +525,12 @@ function bindEvents() {
 
 /**
  * Fallback live-refresh: the popup CANNOT receive chrome.tabs.sendMessage
- * broadcasts (different extension context), so if no STATE_UPDATE arrives
- * within a couple of seconds while a run is active, poll GET_STATE directly.
+ * broadcasts (different extension context), so while a run is active we poll
+ * for state updates every 2 s. BUGFIX: polling GET_STATE hammered the service
+ * worker with a message every 2 s — each wake-up resets Chrome's SW idle
+ * timer, effectively keeping the worker alive forever. Instead we read
+ * chrome.storage.local directly (the engine persists every transition there)
+ * and only message the worker on first use / when storage looks stale.
  */
 let statePollTimer = null;
 function startStatePolling() {
@@ -519,9 +539,49 @@ function startStatePolling() {
     const s = lastState && lastState.status;
     const active = s === "RUNNING" || s === "RETRYING_FAILED" || s === "WAITING_LOGIN";
     if (!active) return; // broadcasts handle idle states fine
-    const reply = await sendToBackground({ type: "GET_STATE" });
-    if (reply.ok && reply.state) renderFromState(reply.state);
+    try {
+      const data = await chrome.storage.local.get(STORAGE_KEYS.state);
+      const st = data[STORAGE_KEYS.state];
+      if (st && Array.isArray(st.items)) {
+        if (!lastState || st.updatedAt !== lastState.updatedAt) renderFromState(st);
+      } else {
+        const reply = await sendToBackground({ type: "GET_STATE" });
+        if (reply.ok && reply.state) renderFromState(reply.state);
+      }
+    } catch (err) {
+      console.warn("[Swayam Popup] State poll failed:", err);
+    }
   }, 2000);
+}
+
+/* ----------------------- Connection status bar ----------------------- */
+
+/**
+ * Ask the background worker to probe the AI tab (PING + CHECK_LOGIN) and paint
+ * the traffic-light indicator: green = connected & logged in, yellow = the
+ * engine is processing, red = tab closed / logged out / content script dead.
+ */
+let connFetching = false;
+async function updateConnectionStatus() {
+  if (connFetching) return;
+  connFetching = true;
+  try {
+    const reply = await sendToBackground({ type: "GET_CONNECTION_STATUS" });
+    if (reply && reply.ok && reply.color) {
+      els.connDot.className = `conn-dot ${reply.color}`;
+      const aiName = (reply.ai || "").toUpperCase() || "AI";
+      let label = reply.label || "Not Connected";
+      if (reply.reason === "not_logged_in") label = `${aiName}: Not logged in`;
+      if (reply.reason === "challenge") label = `${aiName}: Verification page — interact manually, then Resume`;
+      if (reply.color === "green") label = `Connected to ${aiName}`;
+      els.connText.textContent = label;
+    } else {
+      els.connDot.className = "conn-dot unknown";
+      els.connText.textContent = "Checking connection…";
+    }
+  } finally {
+    connFetching = false;
+  }
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -534,4 +594,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   // (progress, queue statuses, recovery banner) exactly where the run is.
   const reply = await sendToBackground({ type: "GET_STATE" });
   renderFromState(reply.ok ? reply.state : null);
+
+  // Paint the connection light now and keep it fresh while the popup is open.
+  updateConnectionStatus();
+  setInterval(updateConnectionStatus, 5000);
 });

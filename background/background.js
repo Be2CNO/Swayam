@@ -106,6 +106,11 @@ const ALARM_STEP = "swayam:step";         // generic timer edge: delay end / tim
 const ALARM_AUTOLOGIN = "swayam:autologin"; // poll while WAITING_LOGIN
 const AUTOLOGIN_PERIOD_MIN = 0.5;          // ~30 s (Chrome clamps <30s periods in prod)
 
+// BUGFIX (stuck prevention): if the site's "new chat" button keeps failing,
+// the new-chat gate would retry forever. After this many CONSECUTIVE failures
+// we stop trying and continue in the current chat (user warned via lastError).
+const NEW_CHAT_MAX_FAILURES = 3;
+
 const DEFAULT_SETTINGS = Object.freeze({
   ai: "chatgpt",
   chatStrategy: "single",   // "single" | "new-chat"
@@ -138,6 +143,7 @@ function makeIdleState(settings) {
     phase: PHASE.IDLE,
     deadline: 0,          // absolute ms timestamp for the currently-scheduled alarm (0 = none)
     promptsSinceChat: 0,  // counter for "new chat every X"
+    newChatFailures: 0,   // consecutive new-chat creation failures (stuck-prevention guard)
     retryQueue: [],       // indices queued for the final failed-only pass
     activeTabId: -1,
     lastError: "",
@@ -364,15 +370,31 @@ async function runNext() {
     return createNewChatThen();
   }
 
+  // BUGFIX: infinite loop guard. If new-chat creation keeps failing, the
+  // counter never resets and every runNext() re-enters the gate above forever.
+  // After NEW_CHAT_MAX_FAILURES consecutive failures we stop trying and
+  // continue in the current chat (the user is warned via lastError).
+  if (S.newChatFailures >= NEW_CHAT_MAX_FAILURES) {
+    console.warn(`[Swayam BG] New chat failed ${S.newChatFailures}x in a row — continuing in the current chat.`);
+    S.promptsSinceChat = 0;
+    S.lastError = `Could not open a new chat after ${NEW_CHAT_MAX_FAILURES} attempts. Continuing in the current chat — check the site UI.`;
+  }
+
   // Inter-prompt delay applies to every dispatch EXCEPT the very first one of
   // a run/fresh resume, so the user is not kept waiting before anything has
   // even been sent.
-  const firstDispatchOfRun = !S.items.some((i) => i.attempted || i.status === "done" || i.status === "failed");
-  if (!firstDispatchOfRun) {
-    return delayedDispatch();
+  // BUGFIX: `attempted` alone is unreliable — sendPromptToIndex() flips it to
+  // true BEFORE the prompt is actually dispatched (login guard / tab errors can
+  // abort the dispatch), which made startRun's "first prompt goes out after one
+  // delay" comment a lie and skipped the delay on genuinely-first sends when an
+  // item was reset to pending mid-run. Count items that reached a terminal
+  // state instead: zero => nothing has truly been processed yet => no delay.
+  const anyProcessed = S.items.some((i) => i.status === "done" || i.status === "failed");
+  if (!anyProcessed) {
+    return sendPromptToIndex(idx);
   }
 
-  return sendPromptToIndex(idx);
+  return delayedDispatch();
 }
 
 /**
@@ -492,7 +514,14 @@ function failItem(idx, reason) {
 
 /** Advance past a failed/skipped item after the normal inter-prompt delay. */
 async function advanceAfterFailure() {
-  if (S.status === STATUS.RETRYING_FAILED && S.retryQueue.length) S.retryQueue.shift();
+  // BUGFIX: only pop the retry queue when the FAILED item actually belongs to
+  // the retry pass. During the MAIN pass this used to shift an innocent index
+  // off retryQueue, silently dropping that prompt from the final retry pass.
+  const failedIdx = S.currentIndex;
+  if (S.status === STATUS.RETRYING_FAILED && S.retryQueue.length &&
+      S.retryQueue[0] === failedIdx) {
+    S.retryQueue.shift();
+  }
   S.currentIndex = -1;
   const nextIdx =
     S.status === STATUS.RETRYING_FAILED
@@ -583,6 +612,7 @@ async function handleStepAlarm() {
     }
     // New chat didn't confirm in time — proceed anyway in whatever chat exists.
     console.warn("[Swayam BG] NEW_CHAT_READY timed out; continuing in current chat.");
+    S.newChatFailures = (S.newChatFailures || 0) + 1; // counts toward the stuck-prevention guard
     S.promptsSinceChat = 0;
     const idx = firstPendingIndex();
     if (idx === -1) return enterRetryPhase();
@@ -616,9 +646,12 @@ async function startRun(queueTexts) {
   broadcastState();
   console.log(`[Swayam BG] RUN STARTED — ${S.items.length} prompts, AI=${settings.ai}, strategy=${settings.chatStrategy}`);
 
-  // First prompt goes out after one inter-prompt delay (gives the tab time).
-  await delayedDispatch();
-  return { ok: true, count: S.items.length };
+  // BUGFIX: the old comment claimed "first prompt goes out after one delay"
+  // but that was never true — delayedDispatch() was called directly and the
+  // runNext() first-prompt branch (which skips the delay) was bypassed. Now
+  // we go through runNext(), which correctly dispatches prompt #1 immediately
+  // (no artificial wait before anything has been sent).
+  return runNext().then(() => ({ ok: true, count: S.items.length }));
 }
 
 async function pauseRun() {
@@ -870,7 +903,12 @@ async function onResponseCaptured(index, text) {
     failItem(index, `Bad response (${badReason}): "${String(text || "").slice(0, 80)}"`);
     S.currentIndex = -1;
     S.phase = PHASE.IDLE;
-    if (S.status === STATUS.RETRYING_FAILED && S.retryQueue.length) S.retryQueue.shift();
+    // BUGFIX: only pop retryQueue when this item IS the active retry item —
+    // same guard as advanceAfterFailure() (which no longer shifts blindly).
+    if (S.status === STATUS.RETRYING_FAILED && item.retried &&
+        S.retryQueue.length && S.retryQueue[0] === index) {
+      S.retryQueue.shift();
+    }
     chrome.alarms.clear(ALARM_STEP);
     if (S.status === STATUS.PAUSED || S.status === STATUS.STOPPED) {
       S.deadline = 0;
@@ -892,7 +930,11 @@ async function onResponseCaptured(index, text) {
   S.currentIndex = -1;
   S.phase = PHASE.IDLE;
   S.promptsSinceChat += 1;
-  if (S.status === STATUS.RETRYING_FAILED && S.retryQueue.length) S.retryQueue.shift();
+  // BUGFIX: guard the shift — only pop when `index` is the active retry item.
+  if (S.status === STATUS.RETRYING_FAILED && item.retried &&
+      S.retryQueue.length && S.retryQueue[0] === index) {
+    S.retryQueue.shift();
+  }
 
   chrome.alarms.clear(ALARM_STEP);
 
@@ -926,6 +968,11 @@ async function onResponseFailed(index, error) {
   const item = S.items[index];
   if (!item || S.currentIndex !== index || S.phase !== PHASE.SENDING) return;
   failItem(index, error);
+  // BUGFIX: guard the shift — only pop when `index` is the active retry item.
+  if (S.status === STATUS.RETRYING_FAILED && item.retried &&
+      S.retryQueue.length && S.retryQueue[0] === index) {
+    S.retryQueue.shift();
+  }
   S.currentIndex = -1;
   S.phase = PHASE.IDLE;
   chrome.alarms.clear(ALARM_STEP);
@@ -945,12 +992,22 @@ async function onNewChatReady(ok, error) {
   chrome.alarms.clear(ALARM_STEP);
   S.phase = PHASE.IDLE;
   S.deadline = 0;
+  // BUGFIX: the AWAIT_NEW_CHAT timeout in handleStepAlarm() did NOT clear this
+  // alarm after firing, so a lingering one-shot could re-enter this handler
+  // later and double-count promptsSinceChat / race with an in-flight prompt.
+  // Clear it here too (idempotent) for defense in depth.
   if (ok) {
     S.promptsSinceChat = 0;
+    S.newChatFailures = 0; // reset the consecutive-failure guard on success
   } else {
+    S.newChatFailures = (S.newChatFailures || 0) + 1;
     console.warn("[Swayam BG] New chat failed:", error, "— continuing in current chat.");
-    S.promptsSinceChat = 0;
-    S.lastError = `New chat request failed (${error}). Continuing in the same chat.`;
+    // BUGFIX: do NOT reset promptsSinceChat on failure. The old code zeroed it,
+    // which meant a single broken new-chat button silently downgraded the whole
+    // run to "one chat for all" — exactly what the user asked to avoid. Keeping
+    // the counter means the gate is retried before the next prompt, and the
+    // engine only proceeds in the current chat after each individual failure.
+    S.lastError = `New chat request failed (${error}). Retrying the new-chat step before the next prompt.`;
   }
   await persistState();
   broadcastState();

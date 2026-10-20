@@ -135,13 +135,16 @@
     site: "gemini",
 
     checkLogin() {
-      if (findComposer()) return { loggedIn: true, challenged: false };
+      // BUGFIX (Gemini): challenge/login walls are checked FIRST. The old
+      // order returned loggedIn:true whenever a composer was present, which
+      // could mis-report on interstitial/auth pages that also render one.
       if (U().queryFirst(document, SELECTORS.challengeWall)) {
         return { loggedIn: false, challenged: true };
       }
       if (U().queryFirst(document, SELECTORS.loginWall)) {
         return { loggedIn: false, challenged: false };
       }
+      if (findComposer()) return { loggedIn: true, challenged: false };
       return { loggedIn: false, challenged: false };
     },
 

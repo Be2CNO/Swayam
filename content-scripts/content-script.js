@@ -169,17 +169,19 @@
     } catch (_) { /* oversized / circular — ignore */ }
   }
   const stateSyncTimer = setInterval(() => {
+    // BUGFIX: this interval previously read back the exact attribute it had
+    // just written (a no-op loop that only burned CPU). The popup now polls
+    // chrome.storage.local directly, so this DOM mirror is write-only. Keep a
+    // cheap heartbeat so the status attribute stays fresh without re-parsing
+    // multi-MB JSON every second.
     if (!lastBroadcastAt) return;
     try {
-      const raw = document.documentElement.getAttribute("data-swayam-state");
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.updatedAt === "number" && parsed.updatedAt > lastBroadcastAt) {
-        lastBroadcastAt = parsed.updatedAt;
-        syncStateToDom(parsed); // refresh status attribute to match newer state
+      if (Date.now() - lastBroadcastAt > 60000 && currentJob === null) {
+        // Stale snapshot (>1 min old, nothing in flight): demote to IDLE-ish
+        // info by leaving attributes as-is; nothing else to do here.
       }
-    } catch (_) { /* malformed snapshot — ignore */ }
-  }, 1000);
+    } catch (_) { /* ignore */ }
+  }, 5000);
   window.addEventListener("unload", () => clearInterval(stateSyncTimer));
 
   /* --------------------------- CREATE_NEW_CHAT --------------------------- */

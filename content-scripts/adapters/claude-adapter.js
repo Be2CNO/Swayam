@@ -138,13 +138,16 @@
     site: "claude",
 
     checkLogin() {
-      if (findComposer()) return { loggedIn: true, challenged: false };
+      // BUGFIX (Claude): challenge/login walls are checked FIRST so an
+      // interstitial page that also renders a composer can't be mis-reported
+      // as logged in.
       if (U().queryFirst(document, SELECTORS.challengeWall)) {
         return { loggedIn: false, challenged: true };
       }
       if (U().queryFirst(document, SELECTORS.loginWall)) {
         return { loggedIn: false, challenged: false };
       }
+      if (findComposer()) return { loggedIn: true, challenged: false };
       return { loggedIn: false, challenged: false };
     },
 
